@@ -16,7 +16,7 @@ export default async function handler(
       hasNeynarKey: !!process.env.NEYNAR_API_KEY,
       hasSignerUuid: !!process.env.NEYNAR_SIGNER_UUID,
       hasCustodyMnemonic: !!process.env.FC_CUSTODY_MNEMONIC,
-      hasRedisUrl: !!(process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL),
+      hasRedisUrl: !!(process.env.KV_REST_API_URL || process.env.fever_KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL),
       hasCronSecret: !!process.env.CRON_SECRET,
       hasYoutubeKey: !!process.env.YOUTUBE_API_KEY,
       channelId: process.env.FARCASTER_CHANNEL_ID || "fever",

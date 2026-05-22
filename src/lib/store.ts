@@ -5,10 +5,18 @@ let redis: Redis | null = null;
 
 function getRedis(): Redis {
   if (!redis) {
-    redis = new Redis({
-      url: (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL)!,
-      token: (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN)!,
-    });
+    // Vercel auto-injects KV_REST_API_* when a database is attached to a single
+    // project, and `<prefix>_KV_REST_API_*` when the same db is shared across
+    // projects (here the Cubs db is shared, so vars come in as `fever_KV_REST_API_*`).
+    const url =
+      process.env.KV_REST_API_URL ||
+      process.env.fever_KV_REST_API_URL ||
+      process.env.UPSTASH_REDIS_REST_URL;
+    const token =
+      process.env.KV_REST_API_TOKEN ||
+      process.env.fever_KV_REST_API_TOKEN ||
+      process.env.UPSTASH_REDIS_REST_TOKEN;
+    redis = new Redis({ url: url!, token: token! });
   }
   return redis;
 }
