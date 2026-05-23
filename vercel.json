@@ -5,7 +5,7 @@
   "functions": {
     "pages/api/cron/check-games.ts": {
       "maxDuration": 300,
-      "includeFiles": "bin/yt-dlp_linux"
+      "includeFiles": "bin/**"
     }
   }
 }
