@@ -3,7 +3,6 @@ import {
   getTodaysFeverGames,
   getRecapMetadata,
   getFeverStandings,
-  type FeverGame,
 } from "../../../src/lib/wnba";
 import type { BoxscorePlayer } from "../../../src/lib/formatter";
 import { findRecapVideoId } from "../../../src/lib/youtube";
@@ -16,6 +15,9 @@ import {
   markGamePosted,
   getGameTracking,
   incrementGameTracking,
+  addPendingGame,
+  removePendingGame,
+  listPendingGames,
 } from "../../../src/lib/store";
 import { FEVER_TEAM_TRICODE, MAX_RECAP_RETRIES } from "../../../src/lib/config";
 
@@ -77,18 +79,28 @@ export default async function handler(
 
   try {
     const games = await getTodaysFeverGames();
-    const finalGames = games.filter((g) => g.isFinal);
-    const results: Record<string, string> = {};
+    const todaysFinalIds = games.filter((g) => g.isFinal).map((g) => g.gameId);
 
-    for (const game of finalGames) {
-      const out = await processGame(game);
-      results[`game_${game.gameId}`] = out;
+    // Seed the pending set with any final Fever game we see on today's
+    // scoreboard. After day rollover the scoreboard will no longer include
+    // these gameIds, but the pending set keeps them in the retry rotation.
+    for (const id of todaysFinalIds) {
+      await addPendingGame(id);
+    }
+
+    const pendingIds = await listPendingGames();
+    const gameIds = Array.from(new Set([...todaysFinalIds, ...pendingIds]));
+
+    const results: Record<string, string> = {};
+    for (const gameId of gameIds) {
+      results[`game_${gameId}`] = await processGame(gameId);
     }
 
     return res.status(200).json({
       ok: true,
-      gamesChecked: finalGames.length,
+      gamesChecked: gameIds.length,
       totalFeverGamesToday: games.length,
+      pendingCount: pendingIds.length,
       results,
     });
   } catch (err) {
@@ -100,10 +112,11 @@ export default async function handler(
   }
 }
 
-async function processGame(game: FeverGame): Promise<string> {
-  const { gameId } = game;
-
+async function processGame(gameId: string): Promise<string> {
   if (await isGamePosted(gameId)) {
+    // Belt-and-suspenders: a posted game shouldn't still be in the pending
+    // set, but clean it up if so.
+    await removePendingGame(gameId);
     return "already posted";
   }
 
@@ -121,6 +134,7 @@ async function processGame(game: FeverGame): Promise<string> {
       await incrementGameTracking(gameId);
       return `waiting for recap metadata (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
     }
+    await removePendingGame(gameId);
     return `gave up: no recap metadata after ${MAX_RECAP_RETRIES} retries`;
   }
 
@@ -143,6 +157,7 @@ async function processGame(game: FeverGame): Promise<string> {
       await incrementGameTracking(gameId);
       return `waiting for YouTube recap (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
     }
+    await removePendingGame(gameId);
     return `gave up: no YouTube recap match after ${MAX_RECAP_RETRIES} retries`;
   }
 
@@ -206,6 +221,7 @@ async function processGame(game: FeverGame): Promise<string> {
 
   if (result.hash) {
     await markGamePosted(gameId, result.hash);
+    await removePendingGame(gameId);
     return usingVideo
       ? `posted (video): ${result.hash}`
       : `posted (yt-fallback): ${result.hash}`;

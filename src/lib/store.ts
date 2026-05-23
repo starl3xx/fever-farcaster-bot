@@ -54,6 +54,23 @@ export async function incrementGameTracking(gameId: string): Promise<number> {
   return count;
 }
 
+// Pending-games set — gameIds still being retried across day boundaries.
+// Today's scoreboard only includes today's games, so without this set a
+// game that rolls off the scoreboard before the recap downloads would
+// become unreachable to the cron.
+export async function addPendingGame(gameId: string): Promise<void> {
+  await getRedis().sadd(REDIS_KEYS.PENDING_GAMES, gameId);
+}
+
+export async function removePendingGame(gameId: string): Promise<void> {
+  await getRedis().srem(REDIS_KEYS.PENDING_GAMES, gameId);
+}
+
+export async function listPendingGames(): Promise<string[]> {
+  const result = await getRedis().smembers(REDIS_KEYS.PENDING_GAMES);
+  return Array.isArray(result) ? result.map(String) : [];
+}
+
 // Health check
 export async function getRedisStatus(): Promise<{
   connected: boolean;
