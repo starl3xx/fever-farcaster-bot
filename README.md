@@ -37,7 +37,7 @@ Top performers are ranked by **NBA Efficiency** (`(PTS+REB+AST+STL+BLK) − ((FG
   WNBA standings page  ──▶  Fever record / streak / conference rank
             │
             ▼
-  yt-dlp + ffmpeg  ──▶  1080p mp4 buffer (via residential proxy)
+  yt-dlp + ffmpeg  ──▶  720p mp4 buffer (via residential proxy)
             │
             ▼
   stream.farcaster.xyz (TUS upload)  ──▶  playback URL
@@ -129,5 +129,6 @@ YouTube's anti-bot system blocks the "video bytes" path from datacenter IPs (Ver
 
 - **Experimental, single-team gate.** Only watches the WNBA scoreboard for `tricode === "IND"`. No fallback logic for postponed/suspended games, no news handling, no odds tracking — strictly Fever recaps.
 - **YouTube extraction depends on the yt-dlp binary version.** When YT changes its format extractors, refresh `bin/yt-dlp_linux` (see above). Logs will show `[yt-dlp] Exited with code N`.
-- **Proxy budget is finite.** A 3 GB Decodo plan covers ~15–25 1080p recaps. Monitor Decodo's "Used Traffic" dashboard mid-season.
-- **No 1080p without ffmpeg.** Removing `bin/ffmpeg` falls back to 360p combined-stream downloads (YouTube only exposes 1080p as separate DASH streams that require remuxing).
+- **Proxy budget is finite.** A 3 GB Decodo plan covers ~30 720p recaps (~100 MB each). Monitor Decodo's "Used Traffic" dashboard mid-season.
+- **Quality is capped at 720p, not 1080p.** Empirically, Decodo's $8.50/GB residential tier sustains HLS pulls cleanly only up to ~100MB / ~2 min. 1080p pulls (~337 MB serial) start fine but hit `[SSL] record layer failure` partway through as the residential IP destabilizes. 720p HLS finishes before that happens. Setting `YT_DLP_MAX_HEIGHT=1080` retries the higher cap — useful if you upgrade proxy plans.
+- **No native video without ffmpeg.** Removing `bin/ffmpeg` falls back to 360p combined-stream downloads (YouTube only exposes 720p+ as HLS fragmented streams that need remuxing).

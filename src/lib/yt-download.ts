@@ -141,14 +141,16 @@ export async function downloadYouTubeMp4(
     const proxyUrl = resolveProxyUrl();
     // WNBA recap videos on YouTube expose 720p/1080p only as HLS m3u8
     // streams (no direct https). Through the Decodo residential proxy,
-    // parallel HLS fragment downloads against one sticky IP trigger
-    // Cloudflare 522 retry storms — but serial single-stream HLS works
-    // cleanly (~838 KB/s observed). We force an explicit format ladder
-    // by ID so yt-dlp picks the highest-res HLS we want (96=1080p, 95=720p,
-    // 94=480p, 93=360p HLS, 18=360p direct https). yt-dlp's "best" alias
-    // would otherwise pick a lower-res variant in this list for opaque
-    // protocol-preference reasons. Override with YT_DLP_MAX_HEIGHT.
-    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "1080";
+    // parallel HLS fragment downloads trigger Cloudflare 522 retry storms,
+    // and 1080p serial downloads hit `[SSL] record layer failure` retries
+    // partway through because the residential IP destabilizes on long
+    // sustained pulls. 720p (~100MB, ~2min) finishes before that happens.
+    //
+    // We force an explicit format ID ladder so yt-dlp picks the highest-res
+    // HLS we want without going off-script: 96=1080p, 95=720p, 94=480p,
+    // 93=360p HLS, 18=360p direct https. Set YT_DLP_MAX_HEIGHT=1080 to
+    // retest 1080p if proxy quality ever improves.
+    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "720";
     // Format ladder by resolution descending, English-language preferred,
     // then any-language. Cap at maxHeight by trimming the front of the list.
     const ladder = [
