@@ -27,17 +27,16 @@ function resolveFfmpegBin(): string {
 
 /**
  * Stream-copy remux of an MPEG-TS-in-MP4 file (yt-dlp HLS output with
- * --fixup never) into a proper streamable MP4, collected in memory. We
- * can't write to a /tmp temp file because Vercel's /tmp is 512MB and a
+ * --fixup never) into a proper streamable container, collected in memory.
+ * We can't write to a /tmp temp file because Vercel's /tmp is 512MB and a
  * 1080p source is ~330MB — there's no room for the output.
  *
  * Cloudflare Stream accepts MPEG-TS-in-MP4 uploads but its transcoder
- * produces a broken stream from them. A proper MP4 input transcodes
- * cleanly.
- *
- * Uses fragmented-MP4 muxing (-movflags empty_moov+frag_keyframe) so
- * ffmpeg can write to stdout without needing to seek back to update the
- * moov atom at the end.
+ * produces a broken stream from them. Fragmented-MP4 output from this
+ * remux also failed Cloudflare's transcode (500s during processing).
+ * Matroska (MKV) is a fully-streamable container (no moov-atom seek-back
+ * needed), broadly supported by Cloudflare's ingest, and avoids whatever
+ * fragmented-MP4 quirk was breaking the transcode.
  */
 export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | null> {
   const ffmpegBin = resolveFfmpegBin();
@@ -46,12 +45,8 @@ export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | 
     filePath,
     "-c",
     "copy",
-    "-bsf:a",
-    "aac_adtstoasc",
     "-f",
-    "mp4",
-    "-movflags",
-    "empty_moov+default_base_moof+frag_keyframe",
+    "matroska",
     "pipe:1",
   ];
   console.log(`[ffmpeg] Spawning: ${ffmpegBin} ${args.join(" ")}`);
