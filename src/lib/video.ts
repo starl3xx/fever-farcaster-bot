@@ -1,5 +1,4 @@
-import { createReadStream } from "fs";
-import { stat } from "fs/promises";
+import { open, stat } from "fs/promises";
 import { fcFetch } from "./farcaster-auth";
 
 export interface VideoFile {
@@ -145,9 +144,22 @@ async function waitForEmbedReady(url: string): Promise<boolean> {
 }
 
 /**
- * Upload video using TUS protocol (resumable upload), streaming the body
- * from disk so we never hold the whole file in memory. fetch() in Node 18+
- * accepts a Node Readable as `body` when `duplex: "half"` is set.
+ * TUS chunk size for PATCH uploads. Cloudflare Stream's TUS endpoint
+ * doesn't accept Transfer-Encoding: chunked (which Node's fetch uses for
+ * stream bodies), so we read the file in fixed-size chunks and PATCH each
+ * one as a separate resumable upload step. 20MB strikes a balance between
+ * HTTP overhead (fewer requests) and memory ceiling (per-chunk buffer).
+ */
+const TUS_CHUNK_SIZE = 20 * 1024 * 1024;
+
+/**
+ * Upload video using TUS protocol (resumable upload). Reads the file from
+ * disk in 20MB chunks, sending each as a separate PATCH with its own
+ * Content-Length. Memory peak is one chunk (~20MB) regardless of file size.
+ *
+ * Cloudflare Stream's TUS endpoint requires fixed-length PATCH bodies.
+ * A single-PATCH streaming body with Transfer-Encoding: chunked (which is
+ * what Node fetch does for a Readable body) 502s instantly.
  */
 async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
   try {
@@ -166,7 +178,6 @@ async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
       return false;
     }
 
-    // The Location header contains the Cloudflare Stream URL for the PATCH upload
     const location = createRes.headers.get("location");
     if (!location) {
       console.error("[video] TUS create returned no Location header");
@@ -174,8 +185,7 @@ async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
     }
     console.log(`[video] TUS location: ${location}`);
 
-    // Verify file is still on disk and matches the size we promised in the
-    // create request (catches accidental cleanup races).
+    // Sanity-check the file is still on disk and at the size we declared.
     const fresh = await stat(file.filePath);
     if (fresh.size !== file.sizeBytes) {
       console.error(
@@ -184,29 +194,50 @@ async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
       return false;
     }
 
-    // TUS PATCH — stream the file directly to the Cloudflare Stream URL.
-    // Note: passing a Node Readable as body requires `duplex: "half"` in
-    // the RequestInit, even though it's not in the standard TS types.
-    const fileStream = createReadStream(file.filePath);
-    const patchRes = await fetch(location, {
-      method: "PATCH",
-      headers: {
-        "Tus-Resumable": "1.0.0",
-        "Upload-Offset": "0",
-        "Content-Type": "application/offset+octet-stream",
-        "Content-Length": String(file.sizeBytes),
-      },
-      body: fileStream as unknown as BodyInit,
-      duplex: "half",
-    } as RequestInit & { duplex: "half" });
+    // Read + PATCH in 20MB chunks. Reuses a single buffer for all chunks
+    // so memory stays flat throughout the upload.
+    const fh = await open(file.filePath, "r");
+    try {
+      const chunkBuf = Buffer.allocUnsafe(TUS_CHUNK_SIZE);
+      let offset = 0;
+      while (offset < file.sizeBytes) {
+        const bytesToRead = Math.min(TUS_CHUNK_SIZE, file.sizeBytes - offset);
+        const { bytesRead } = await fh.read(chunkBuf, 0, bytesToRead, offset);
+        if (bytesRead === 0) {
+          console.error(`[video] TUS unexpected EOF at offset ${offset}`);
+          return false;
+        }
+        const chunk = chunkBuf.subarray(0, bytesRead);
 
-    if (patchRes.status === 204 || patchRes.ok) {
+        const patchRes = await fetch(location, {
+          method: "PATCH",
+          headers: {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": String(offset),
+            "Content-Type": "application/offset+octet-stream",
+            "Content-Length": String(bytesRead),
+          },
+          body: chunk as unknown as BodyInit,
+        });
+
+        if (patchRes.status !== 204 && !patchRes.ok) {
+          console.error(
+            `[video] TUS PATCH @${offset} (${bytesRead}b) failed: ${patchRes.status} ${await patchRes.text()}`
+          );
+          return false;
+        }
+
+        offset += bytesRead;
+        const pct = ((offset / file.sizeBytes) * 100).toFixed(1);
+        console.log(
+          `[video] TUS uploaded ${pct}% (${offset}/${file.sizeBytes})`
+        );
+      }
       console.log("[video] TUS upload succeeded");
       return true;
+    } finally {
+      await fh.close();
     }
-
-    console.error(`[video] TUS PATCH failed: ${patchRes.status} ${await patchRes.text()}`);
-    return false;
   } catch (err) {
     console.error("[video] TUS upload error:", err);
     return false;
