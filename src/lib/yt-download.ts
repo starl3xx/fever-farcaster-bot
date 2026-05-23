@@ -132,9 +132,25 @@ export async function listFormats(videoId: string): Promise<string> {
   });
 }
 
+export interface DownloadResult {
+  filePath: string;
+  sizeBytes: number;
+  duration: number;
+}
+
+/**
+ * Downloads the recap video to a tempfile on disk and returns the path +
+ * size. The caller is responsible for deleting the tempfile after use
+ * (usually via the upload pipeline, which streams from disk).
+ *
+ * NB: returns a path, not a buffer. A 1080p recap is ~330MB; loading it
+ * into a Node Buffer and copying it (`new Uint8Array(buf)`) blows past
+ * Vercel's 2GB function memory once fetch's TUS body buffer is added on
+ * top. Streaming from disk to fetch keeps peak memory under ~100MB.
+ */
 export async function downloadYouTubeMp4(
   videoId: string
-): Promise<{ buffer: Uint8Array; duration: number } | null> {
+): Promise<DownloadResult | null> {
   const url = `https://youtube.com/watch?v=${videoId}`;
   const tempPath = path.join(os.tmpdir(), `recap-${videoId}-${Date.now()}.mp4`);
 
@@ -258,26 +274,28 @@ export async function downloadYouTubeMp4(
       stdout.flush();
       stderr.flush();
       console.log(`[yt-dlp] Process closed with exit code: ${code}`);
+      if (code !== 0) {
+        console.error(
+          `[yt-dlp] Exited with code ${code}. stderr:\n${stderrBuf}`
+        );
+        await fs.unlink(tempPath).catch(() => {});
+        resolve(null);
+        return;
+      }
       try {
-        if (code !== 0) {
-          console.error(
-            `[yt-dlp] Exited with code ${code}. stderr:\n${stderrBuf}`
-          );
-          resolve(null);
-          return;
-        }
-        const buffer = await fs.readFile(tempPath);
-        const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
+        const stat = await fs.stat(tempPath);
+        const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
         const elapsedMs = Date.now() - startMs;
         console.log(
           `[yt-dlp] Downloaded ${sizeMB}MB in ${(elapsedMs / 1000).toFixed(1)}s`
         );
-        resolve({ buffer: new Uint8Array(buffer), duration: 0 });
+        // NB: don't unlink — the caller streams from this file and is
+        // responsible for cleanup.
+        resolve({ filePath: tempPath, sizeBytes: stat.size, duration: 0 });
       } catch (err) {
-        console.error("[yt-dlp] Failed to read tempfile:", err);
-        resolve(null);
-      } finally {
+        console.error("[yt-dlp] Failed to stat tempfile:", err);
         await fs.unlink(tempPath).catch(() => {});
+        resolve(null);
       }
     });
   });

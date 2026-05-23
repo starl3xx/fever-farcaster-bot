@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
+import { unlink } from "fs/promises";
 import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
 
 // Force yt-dlp verbose mode for debug invocations so we can see ffmpeg's
@@ -42,11 +43,17 @@ export default async function handler(
     });
   }
 
-  return res.status(200).json({
-    ok: true,
-    videoId,
-    elapsedMs,
-    sizeBytes: result.buffer.length,
-    sizeMB: (result.buffer.length / 1024 / 1024).toFixed(1),
-  });
+  try {
+    return res.status(200).json({
+      ok: true,
+      videoId,
+      elapsedMs,
+      sizeBytes: result.sizeBytes,
+      sizeMB: (result.sizeBytes / 1024 / 1024).toFixed(1),
+    });
+  } finally {
+    // Debug endpoint owns cleanup (the cron path's upload step handles
+    // cleanup in production).
+    await unlink(result.filePath).catch(() => {});
+  }
 }

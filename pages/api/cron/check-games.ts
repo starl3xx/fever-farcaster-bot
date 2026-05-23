@@ -171,9 +171,19 @@ async function processGame(gameId: string): Promise<string> {
   if (!download) {
     videoFailureReason = `yt-dlp download failed for ${videoId}`;
   } else {
-    playbackUrl = await uploadToFarcasterStream(download.buffer, gameId);
-    if (!playbackUrl) {
-      videoFailureReason = "farcaster stream upload failed";
+    try {
+      playbackUrl = await uploadToFarcasterStream(
+        { filePath: download.filePath, sizeBytes: download.sizeBytes },
+        gameId
+      );
+      if (!playbackUrl) {
+        videoFailureReason = "farcaster stream upload failed";
+      }
+    } finally {
+      // The download returns a tempfile path; we own cleanup after the
+      // upload has either succeeded or failed.
+      const { unlink } = await import("fs/promises");
+      await unlink(download.filePath).catch(() => {});
     }
   }
 

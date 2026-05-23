@@ -1,23 +1,31 @@
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
 import { fcFetch } from "./farcaster-auth";
+
+export interface VideoFile {
+  filePath: string;
+  sizeBytes: number;
+}
 
 /**
  * Upload an mp4 to Farcaster's video infrastructure and return a native
  * playback URL that renders as inline video in Farcaster clients.
  *
- * Flow: get mp4 bytes (from URL or buffer) → prepare upload → TUS upload to
- * stream.farcaster.xyz → poll until ready → return embed URL.
+ * Flow: prepare upload → TUS upload (streams from disk) → poll until ready
+ * → return embed URL.
  *
- * Accepts either a URL string (downloaded via fetch) or a Uint8Array (used
- * directly). The buffer path supports yt-dlp output without an intermediate
- * HTTP hop.
+ * Accepts either a URL string (downloaded via fetch into a tempfile) or a
+ * `VideoFile` `{ filePath, sizeBytes }`. Streaming from disk keeps function
+ * memory low — a 1080p recap is ~330MB and we have a 2GB budget total
+ * including all the upload-side allocations.
  */
 export async function uploadToFarcasterStream(
-  input: string | Uint8Array,
+  input: string | VideoFile,
   _slug: string
 ): Promise<string | null> {
   try {
-    // 1. Get the mp4 bytes — either fetch from URL or use the provided buffer
-    let videoBuffer: Uint8Array;
+    // 1. Resolve to a `VideoFile` on disk.
+    let videoFile: VideoFile;
     if (typeof input === "string") {
       console.log(`[video] Downloading mp4: ${input}`);
       const dlResponse = await fetch(input);
@@ -25,13 +33,18 @@ export async function uploadToFarcasterStream(
         console.error(`[video] Failed to fetch mp4: ${dlResponse.status}`);
         return null;
       }
-      videoBuffer = new Uint8Array(await dlResponse.arrayBuffer());
-      const sizeMB = (videoBuffer.length / 1024 / 1024).toFixed(1);
-      console.log(`[video] Downloaded ${sizeMB}MB`);
+      // Old URL-input path. The new in-tree caller passes VideoFile directly,
+      // so this branch only runs for legacy callers. Keeping for back-compat.
+      const bytes = new Uint8Array(await dlResponse.arrayBuffer());
+      const tmpPath = `/tmp/fc-fetch-${Date.now()}.mp4`;
+      const { writeFile } = await import("fs/promises");
+      await writeFile(tmpPath, bytes);
+      videoFile = { filePath: tmpPath, sizeBytes: bytes.length };
+      console.log(`[video] Downloaded ${(bytes.length / 1024 / 1024).toFixed(1)}MB → ${tmpPath}`);
     } else {
-      videoBuffer = input;
-      const sizeMB = (videoBuffer.length / 1024 / 1024).toFixed(1);
-      console.log(`[video] Using provided buffer: ${sizeMB}MB`);
+      videoFile = input;
+      const sizeMB = (videoFile.sizeBytes / 1024 / 1024).toFixed(1);
+      console.log(`[video] Using file ${videoFile.filePath} (${sizeMB}MB)`);
     }
 
     // 2. Prepare the upload — get a videoId and TUS upload URL
@@ -40,7 +53,7 @@ export async function uploadToFarcasterStream(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        videoSizeBytes: videoBuffer.length,
+        videoSizeBytes: videoFile.sizeBytes,
         supportsDynamicUpload: true,
       }),
     });
@@ -64,9 +77,9 @@ export async function uploadToFarcasterStream(
     console.log(`[video] Video prepared: ${videoId}`);
 
     // 3. Upload via TUS protocol to the provided upload URL
-    const sizeMB = (videoBuffer.length / 1024 / 1024).toFixed(1);
+    const sizeMB = (videoFile.sizeBytes / 1024 / 1024).toFixed(1);
     console.log(`[video] Uploading ${sizeMB}MB via TUS...`);
-    const uploaded = await tusUpload(uploadUrl, videoBuffer);
+    const uploaded = await tusUpload(uploadUrl, videoFile);
 
     if (!uploaded) {
       console.error("[video] TUS upload failed");
@@ -132,17 +145,18 @@ async function waitForEmbedReady(url: string): Promise<boolean> {
 }
 
 /**
- * Upload video using TUS protocol (resumable upload).
- * Uses a single creation + data request for simplicity since files are <100MB.
+ * Upload video using TUS protocol (resumable upload), streaming the body
+ * from disk so we never hold the whole file in memory. fetch() in Node 18+
+ * accepts a Node Readable as `body` when `duplex: "half"` is set.
  */
-async function tusUpload(endpoint: string, data: Uint8Array): Promise<boolean> {
+async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
   try {
     // TUS creation request — no Content-Type (causes 415 on Farcaster's proxy)
     const createRes = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Tus-Resumable": "1.0.0",
-        "Upload-Length": String(data.length),
+        "Upload-Length": String(file.sizeBytes),
         "Upload-Metadata": `filename ${btoa("video.mp4")},filetype ${btoa("video/mp4")}`,
       },
     });
@@ -160,16 +174,31 @@ async function tusUpload(endpoint: string, data: Uint8Array): Promise<boolean> {
     }
     console.log(`[video] TUS location: ${location}`);
 
-    // TUS PATCH — send the full file in one go to the Cloudflare Stream URL
+    // Verify file is still on disk and matches the size we promised in the
+    // create request (catches accidental cleanup races).
+    const fresh = await stat(file.filePath);
+    if (fresh.size !== file.sizeBytes) {
+      console.error(
+        `[video] File size changed: expected ${file.sizeBytes}, got ${fresh.size}`
+      );
+      return false;
+    }
+
+    // TUS PATCH — stream the file directly to the Cloudflare Stream URL.
+    // Note: passing a Node Readable as body requires `duplex: "half"` in
+    // the RequestInit, even though it's not in the standard TS types.
+    const fileStream = createReadStream(file.filePath);
     const patchRes = await fetch(location, {
       method: "PATCH",
       headers: {
         "Tus-Resumable": "1.0.0",
         "Upload-Offset": "0",
         "Content-Type": "application/offset+octet-stream",
+        "Content-Length": String(file.sizeBytes),
       },
-      body: data as unknown as BodyInit,
-    });
+      body: fileStream as unknown as BodyInit,
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
 
     if (patchRes.status === 204 || patchRes.ok) {
       console.log("[video] TUS upload succeeded");
