@@ -180,7 +180,12 @@ export async function downloadYouTubeMp4(
       "mp4",
       "--socket-timeout",
       "30",
-      "--newline", // progress on new lines so we can stream-parse stderr
+      // Suppress per-fragment progress lines. At 25+ MiB/s through Bright
+      // Data ISP, a 120-fragment HLS download generates 6000+ progress
+      // lines in seconds — Vercel's log buffer caps at 256 messages per
+      // request, so the actual exit/error info gets dropped. We keep
+      // [info]/[error] lines which carry the diagnostics we care about.
+      "--no-progress",
       ...(verbose ? ["-v"] : ["--no-warnings"]),
       ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
       ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
