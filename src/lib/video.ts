@@ -45,6 +45,11 @@ export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | 
     filePath,
     "-c",
     "copy",
+    // MPEG-TS carries AAC as ADTS frames. Modern containers (MP4, MKV)
+    // need the AAC reformatted to ASC for the audio header. Without this
+    // filter, matroska muxer errors: "Error parsing AAC extradata".
+    "-bsf:a",
+    "aac_adtstoasc",
     "-f",
     "matroska",
     "pipe:1",
