@@ -1,6 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
 
+// Force yt-dlp verbose mode for debug invocations so we can see ffmpeg's
+// real stderr (otherwise yt-dlp swallows it behind generic "Conversion
+// failed!" messages).
+process.env.YT_DLP_VERBOSE = "1";
+
 /**
  * Diagnostic endpoint — runs the yt-dlp download path against a videoId and
  * returns size + elapsed without posting to Farcaster or marking the game
