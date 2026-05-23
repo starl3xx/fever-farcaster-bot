@@ -41,6 +41,36 @@ function resolveQjsBin(): string | null {
   return null;
 }
 
+/**
+ * Parse Decodo's `host:port:user:pass` credentials format and return a
+ * yt-dlp-compatible `http://user:pass@host:port` proxy URL. The password
+ * is URL-encoded — Decodo passwords routinely contain `+`, `/`, etc., which
+ * break userinfo parsing otherwise. Returns null when DECODO_PROXY is unset
+ * (no-op behavior — yt-dlp will route directly).
+ */
+function resolveProxyUrl(): string | null {
+  const raw = process.env.DECODO_PROXY;
+  if (!raw) return null;
+  const parts = raw.split(":");
+  if (parts.length < 4) {
+    console.warn(
+      "[yt-dlp] DECODO_PROXY malformed; expected host:port:user:pass"
+    );
+    return null;
+  }
+  const [host, port, user] = parts;
+  // Password may contain `:` (unlikely but harmless to tolerate).
+  const pass = parts.slice(3).join(":");
+  return `http://${encodeURIComponent(user)}:${encodeURIComponent(
+    pass
+  )}@${host}:${port}`;
+}
+
+/** Strip userinfo from a proxy URL so it can be logged without leaking creds. */
+function redactProxy(url: string): string {
+  return url.replace(/\/\/[^@]+@/, "//<creds>@");
+}
+
 export async function downloadYouTubeMp4(
   videoId: string
 ): Promise<{ buffer: Uint8Array; duration: number } | null> {
@@ -49,21 +79,26 @@ export async function downloadYouTubeMp4(
   return new Promise((resolve) => {
     try {
       const qjsBin = resolveQjsBin();
+      const proxyUrl = resolveProxyUrl();
       const args = [
         "-f",
-        "bv*[height<=720]+ba/b[height<=720]",
+        "bv*[height<=1080]+ba/b[height<=1080]",
         "--merge-output-format",
         "mp4",
         "--extractor-args",
         "youtube:player_client=tv,ios,mweb,android",
         ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
+        ...(proxyUrl ? ["--proxy", proxyUrl] : []),
         "-o",
         "-",
         url,
       ];
 
       const bin = resolveYtDlpBin();
-      console.log(`[yt-dlp] Spawning: ${bin} ${args.join(" ")}`);
+      const safeArgs = proxyUrl
+        ? args.map((a) => (a === proxyUrl ? redactProxy(a) : a))
+        : args;
+      console.log(`[yt-dlp] Spawning: ${bin} ${safeArgs.join(" ")}`);
       const proc = spawn(bin, args, {
         stdio: ["ignore", "pipe", "pipe"],
       });
