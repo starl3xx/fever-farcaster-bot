@@ -2,8 +2,10 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import {
   getTodaysFeverGames,
   getRecapMetadata,
+  getFeverStandings,
   type FeverGame,
 } from "../../../src/lib/wnba";
+import type { BoxscorePlayer } from "../../../src/lib/formatter";
 import { findRecapVideoId } from "../../../src/lib/youtube";
 import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
 import { uploadToFarcasterStream } from "../../../src/lib/video";
@@ -25,6 +27,7 @@ interface BoxscoreTeam {
   teamName: string;
   teamCity: string;
   score: number;
+  players: BoxscorePlayer[];
 }
 
 async function fetchBoxscore(gameId: string): Promise<{
@@ -49,6 +52,7 @@ async function fetchBoxscore(gameId: string): Promise<{
     teamName: String(t?.teamName || ""),
     teamCity: String(t?.teamCity || ""),
     score: Number(t?.score ?? 0),
+    players: Array.isArray(t?.players) ? (t.players as BoxscorePlayer[]) : [],
   });
 
   return {
@@ -171,14 +175,24 @@ async function processGame(game: FeverGame): Promise<string> {
   }
 
   const isHome = box.home.teamTricode === FEVER_TEAM_TRICODE;
+  const feverPlayers = (isHome ? box.home.players : box.away.players) || [];
+
+  // Fetch league standings for Fever's record/streak/conf-rank line.
+  // Non-fatal: if it fails we still post without the standings section.
+  const standings = await getFeverStandings().catch((err) => {
+    console.error("[check-games] standings fetch threw:", err);
+    return null;
+  });
+
   const text = formatRecapCast({
     homeTricode: box.home.teamTricode,
     awayTricode: box.away.teamTricode,
-    homeName: fullTeamName(box.home),
-    awayName: fullTeamName(box.away),
+    homeShortName: box.home.teamName,
+    awayShortName: box.away.teamName,
     homeScore: box.home.score,
     awayScore: box.away.score,
-    isHome,
+    feverPlayers,
+    standings,
   });
 
   const usingVideo = playbackUrl !== null;

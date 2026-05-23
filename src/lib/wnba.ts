@@ -2,6 +2,7 @@ import {
   FEVER_TEAM_TRICODE,
   WNBA_SCOREBOARD_URL,
   WNBA_GAME_PAGE_URL,
+  WNBA_STANDINGS_URL,
 } from "./config";
 
 const BROWSER_UA =
@@ -165,5 +166,75 @@ export async function getRecapMetadata(
     featuredImage: String(pick?.featuredImage || ""),
     franchiseName: String(pick?.videoFranchisesName || ""),
     gameDateISO,
+  };
+}
+
+export interface FeverStandings {
+  record: string;          // e.g. "4-2"
+  winPct: number;          // e.g. 0.667
+  currentStreak: string;   // e.g. "W3"  (space stripped from "W 3")
+  conferenceRank: number;  // 1-indexed rank within East
+  conferenceLabel: string; // e.g. "E. Conference"
+}
+
+/**
+ * Fetch the WNBA standings page and extract Indiana's record, win pct, current
+ * streak, and rank within the Eastern Conference. Returns null if anything
+ * fails — callers should treat the standings line as optional.
+ */
+export async function getFeverStandings(): Promise<FeverStandings | null> {
+  const res = await fetch(WNBA_STANDINGS_URL, {
+    headers: {
+      "User-Agent": BROWSER_UA,
+      Accept: "text/html,application/xhtml+xml",
+    },
+  });
+  if (!res.ok) {
+    console.error(`[standings] fetch failed: ${res.status}`);
+    return null;
+  }
+
+  const html = await res.text();
+  const match = html.match(
+    /<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/
+  );
+  if (!match) {
+    console.error("[standings] No __NEXT_DATA__ script tag");
+    return null;
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(match[1]);
+  } catch (err) {
+    console.error("[standings] Failed to parse __NEXT_DATA__:", err);
+    return null;
+  }
+
+  const rows: any[] = payload?.props?.pageProps?.standingsRowsData || [];
+  const indRow = rows.find((r) => r?.TeamTricode === FEVER_TEAM_TRICODE);
+  if (!indRow) {
+    console.error("[standings] IND row not in standingsRowsData");
+    return null;
+  }
+
+  const conference: string = String(indRow.Conference || "East");
+  // PlayoffRank is league-wide (1..N), but sorting Conference-mates by it
+  // yields the canonical conference rank.
+  const inConf = rows
+    .filter((r) => r?.Conference === conference)
+    .sort((a, b) => Number(a.PlayoffRank) - Number(b.PlayoffRank));
+  const conferenceRank =
+    inConf.findIndex((r) => r?.TeamTricode === FEVER_TEAM_TRICODE) + 1;
+
+  const conferenceLabel =
+    conference === "East" ? "E. Conference" : conference === "West" ? "W. Conference" : `${conference} Conference`;
+
+  return {
+    record: String(indRow.Record || `${indRow.WINS}-${indRow.LOSSES}`),
+    winPct: Number(indRow.WinPCT) || 0,
+    currentStreak: String(indRow.strCurrentStreak || "").replace(/\s+/g, ""),
+    conferenceRank,
+    conferenceLabel,
   };
 }

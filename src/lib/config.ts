@@ -5,6 +5,7 @@ export const CAST_CHAR_LIMIT = 1024;
 export const WNBA_LEAGUE_ID = 10;
 export const WNBA_SCOREBOARD_URL = `https://cdn.wnba.com/static/json/liveData/scoreboard/todaysScoreboard_${WNBA_LEAGUE_ID}.json`;
 export const WNBA_GAME_PAGE_URL = (gameId: string) => `https://www.wnba.com/game/${gameId}`;
+export const WNBA_STANDINGS_URL = "https://www.wnba.com/standings";
 
 // YouTube channels to search for official recaps (preferred order).
 // Verified 2026-05-22 against youtube.com/@WNBA and youtube.com/@IndianaFever
