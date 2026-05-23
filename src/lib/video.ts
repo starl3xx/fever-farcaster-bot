@@ -43,15 +43,20 @@ export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | 
   const args = [
     "-i",
     filePath,
-    // Stream-copy the H.264 video (no re-encoding cost) but re-encode the
-    // audio. The MPEG-TS source carries AAC as ADTS frames whose extradata
-    // doesn't survive `-c copy` cleanly into MKV — even with the
-    // aac_adtstoasc bitstream filter, matroska's muxer errors:
-    // "Error parsing AAC extradata, unable to determine samplerate".
-    // Re-encoding the audio (ffmpeg's native AAC encoder) regenerates
-    // valid extradata. 10 min of 130kbps stereo AAC adds <1s of ffmpeg time.
+    // Re-encode both video AND audio. Stream-copying the MPEG-TS H.264
+    // bitstream produced files ffmpeg accepted but Cloudflare Stream's
+    // transcoder failed on (500 errors during transcode, regardless of
+    // container format: fragmented MP4 or MKV). The H.264 stream from
+    // HLS MPEG-TS has framing quirks that confuse Cloudflare's pipeline.
+    // libx264 at preset=veryfast on 10 min of 1080p takes ~2-3 min of CPU
+    // time, well within Vercel's 600s function budget. crf 23 is the
+    // standard "visually lossless" quality target.
     "-c:v",
-    "copy",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
     "-c:a",
     "aac",
     "-b:a",
