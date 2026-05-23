@@ -142,14 +142,27 @@ export async function downloadYouTubeMp4(
     // WNBA recap videos on YouTube expose 720p/1080p only as HLS m3u8
     // streams (no direct https). Through the Decodo residential proxy,
     // parallel HLS fragment downloads against one sticky IP trigger
-    // Cloudflare 522 retry storms, so we cap at 720p (~149MB) and download
-    // serially. The selector still prefers h264+aac so ffmpeg stream-copies.
-    // Override the cap with YT_DLP_MAX_HEIGHT (e.g. "1080") to retest 1080p.
-    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "720";
+    // Cloudflare 522 retry storms — but serial single-stream HLS works
+    // cleanly (~838 KB/s observed). We force an explicit format ladder
+    // by ID so yt-dlp picks the highest-res HLS we want (96=1080p, 95=720p,
+    // 94=480p, 93=360p HLS, 18=360p direct https). yt-dlp's "best" alias
+    // would otherwise pick a lower-res variant in this list for opaque
+    // protocol-preference reasons. Override with YT_DLP_MAX_HEIGHT.
+    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "1080";
+    // Format ladder by resolution descending, English-language preferred,
+    // then any-language. Cap at maxHeight by trimming the front of the list.
+    const ladder = [
+      { id: "96", height: 1080 },
+      { id: "95", height: 720 },
+      { id: "94", height: 480 },
+      { id: "93", height: 360 },
+      { id: "18", height: 360 }, // 360p direct https (no HLS)
+    ];
+    const ladderIds = ladder
+      .filter((f) => f.height <= Number(maxHeight))
+      .flatMap((f) => (f.id === "18" ? ["18"] : [`${f.id}-8`, f.id]));
     const formatSelector =
-      `bv*[height<=${maxHeight}][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/` +
-      `bv*[height<=${maxHeight}]+ba/` +
-      `b[height<=${maxHeight}]`;
+      ladderIds.join("/") + `/b[height<=${maxHeight}]`;
 
     const verbose = process.env.YT_DLP_VERBOSE === "1";
     const args = [
