@@ -155,6 +155,12 @@ export async function downloadYouTubeMp4(
     const args = [
       "-f",
       formatSelector,
+      // Bias toward resolution. By default yt-dlp prefers https-direct
+      // streams over HLS m3u8 when "best" is close — that meant `b[height<=720]`
+      // picked format 18 (360p direct) over format 95 (720p HLS). Explicitly
+      // sorting by resolution-descending forces 720p HLS when available.
+      "--format-sort",
+      "res,vcodec:avc1,acodec:mp4a",
       "--merge-output-format",
       "mp4",
       "--socket-timeout",
