@@ -207,7 +207,7 @@ export async function downloadYouTubeMp4(
     // buffered copy of stderr too so error reporting still has the full text.
     function makeLineStreamer(label: string) {
       let leftover = "";
-      return (chunk: Buffer) => {
+      const writeChunk = (chunk: Buffer) => {
         const text = leftover + chunk.toString();
         const lines = text.split("\n");
         leftover = lines.pop() ?? "";
@@ -215,13 +215,20 @@ export async function downloadYouTubeMp4(
           if (line) console.log(`[yt-dlp:${label}] ${line}`);
         }
       };
+      const flush = () => {
+        if (leftover) {
+          console.log(`[yt-dlp:${label}] ${leftover}`);
+          leftover = "";
+        }
+      };
+      return { writeChunk, flush };
     }
-    const stdoutStreamer = makeLineStreamer("out");
-    const stderrStreamer = makeLineStreamer("err");
-    proc.stdout.on("data", stdoutStreamer);
+    const stdout = makeLineStreamer("out");
+    const stderr = makeLineStreamer("err");
+    proc.stdout.on("data", stdout.writeChunk);
     proc.stderr.on("data", (chunk: Buffer) => {
       stderrBuf += chunk.toString();
-      stderrStreamer(chunk);
+      stderr.writeChunk(chunk);
     });
 
     proc.on("error", async (err) => {
@@ -231,6 +238,11 @@ export async function downloadYouTubeMp4(
     });
 
     proc.on("close", async (code) => {
+      // Flush any trailing partial lines (yt-dlp's final messages often
+      // don't end with \n; without this they'd vanish before we log them).
+      stdout.flush();
+      stderr.flush();
+      console.log(`[yt-dlp] Process closed with exit code: ${code}`);
       try {
         if (code !== 0) {
           console.error(
