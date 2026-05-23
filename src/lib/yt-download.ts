@@ -85,6 +85,50 @@ function redactProxy(url: string): string {
   return url.replace(/\/\/[^@]+@/, "//<creds>@");
 }
 
+/**
+ * Run `yt-dlp --list-formats` for diagnostic purposes. Streams output to
+ * the log so we can see exactly which formats YouTube exposes through the
+ * proxy. Consumes minimal bandwidth (no video bytes downloaded).
+ */
+export async function listFormats(videoId: string): Promise<string> {
+  const url = `https://youtube.com/watch?v=${videoId}`;
+  const qjsBin = resolveQjsBin();
+  const proxyUrl = resolveProxyUrl();
+  const args = [
+    "--list-formats",
+    "--socket-timeout",
+    "30",
+    ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
+    ...(proxyUrl ? ["--proxy", proxyUrl] : []),
+    url,
+  ];
+  const bin = resolveYtDlpBin();
+  const safeArgs = proxyUrl
+    ? args.map((a) => (a === proxyUrl ? redactProxy(a) : a))
+    : args;
+  console.log(`[yt-dlp] Spawning: ${bin} ${safeArgs.join(" ")}`);
+
+  return new Promise((resolve) => {
+    const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    proc.stdout.on("data", (c: Buffer) => {
+      const s = c.toString();
+      out += s;
+      console.log(`[yt-dlp:out] ${s.trimEnd()}`);
+    });
+    proc.stderr.on("data", (c: Buffer) => {
+      const s = c.toString();
+      out += s;
+      console.log(`[yt-dlp:err] ${s.trimEnd()}`);
+    });
+    proc.on("error", (err) => {
+      console.error("[yt-dlp] Spawn error:", err);
+      resolve(out);
+    });
+    proc.on("close", () => resolve(out));
+  });
+}
+
 export async function downloadYouTubeMp4(
   videoId: string
 ): Promise<{ buffer: Uint8Array; duration: number } | null> {
@@ -104,6 +148,7 @@ export async function downloadYouTubeMp4(
       "bv*[height<=1080]+ba/" +
       "b[height<=1080]";
 
+    const verbose = process.env.YT_DLP_VERBOSE === "1";
     const args = [
       "-f",
       formatSelector,
@@ -113,7 +158,8 @@ export async function downloadYouTubeMp4(
       "4",
       "--socket-timeout",
       "30",
-      "--no-warnings",
+      "--newline", // progress on new lines so we can stream-parse stderr
+      ...(verbose ? ["-v"] : ["--no-warnings"]),
       ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
       ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
       ...(proxyUrl ? ["--proxy", proxyUrl] : []),
@@ -133,11 +179,27 @@ export async function downloadYouTubeMp4(
     let stderrBuf = "";
     const startMs = Date.now();
 
-    // yt-dlp's normal progress output goes to stdout, but with -o <file>
-    // it's only a couple of "[download]" lines — we discard them.
-    proc.stdout.on("data", () => {});
+    // Stream stdout (yt-dlp progress lines from --newline) and stderr to the
+    // log in real time. Without this we lose visibility into long downloads
+    // because Vercel only shows logs after the function returns. Keep a
+    // buffered copy of stderr too so error reporting still has the full text.
+    function makeLineStreamer(label: string) {
+      let leftover = "";
+      return (chunk: Buffer) => {
+        const text = leftover + chunk.toString();
+        const lines = text.split("\n");
+        leftover = lines.pop() ?? "";
+        for (const line of lines) {
+          if (line) console.log(`[yt-dlp:${label}] ${line}`);
+        }
+      };
+    }
+    const stdoutStreamer = makeLineStreamer("out");
+    const stderrStreamer = makeLineStreamer("err");
+    proc.stdout.on("data", stdoutStreamer);
     proc.stderr.on("data", (chunk: Buffer) => {
       stderrBuf += chunk.toString();
+      stderrStreamer(chunk);
     });
 
     proc.on("error", async (err) => {

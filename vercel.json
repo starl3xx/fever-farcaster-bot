@@ -7,6 +7,15 @@
       "maxDuration": 600,
       "memory": 2048,
       "includeFiles": "bin/**"
+    },
+    "pages/api/debug/download.ts": {
+      "maxDuration": 600,
+      "memory": 2048,
+      "includeFiles": "bin/**"
+    },
+    "pages/api/debug/list-formats.ts": {
+      "maxDuration": 60,
+      "includeFiles": "bin/**"
     }
   }
 }
