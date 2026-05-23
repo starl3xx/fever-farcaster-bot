@@ -43,13 +43,19 @@ export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | 
   const args = [
     "-i",
     filePath,
-    "-c",
+    // Stream-copy the H.264 video (no re-encoding cost) but re-encode the
+    // audio. The MPEG-TS source carries AAC as ADTS frames whose extradata
+    // doesn't survive `-c copy` cleanly into MKV — even with the
+    // aac_adtstoasc bitstream filter, matroska's muxer errors:
+    // "Error parsing AAC extradata, unable to determine samplerate".
+    // Re-encoding the audio (ffmpeg's native AAC encoder) regenerates
+    // valid extradata. 10 min of 130kbps stereo AAC adds <1s of ffmpeg time.
+    "-c:v",
     "copy",
-    // MPEG-TS carries AAC as ADTS frames. Modern containers (MP4, MKV)
-    // need the AAC reformatted to ASC for the audio header. Without this
-    // filter, matroska muxer errors: "Error parsing AAC extradata".
-    "-bsf:a",
-    "aac_adtstoasc",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
     "-f",
     "matroska",
     "pipe:1",
