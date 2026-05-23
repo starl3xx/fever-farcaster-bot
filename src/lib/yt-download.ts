@@ -47,10 +47,13 @@ function resolveQjsBin(): string | null {
   return null;
 }
 
-function resolveFfmpegBin(): string | null {
+function resolveFfmpegLocation(): string | null {
   if (process.env.YT_DLP_FFMPEG_BIN) return process.env.YT_DLP_FFMPEG_BIN;
   if (process.env.VERCEL) {
-    return path.join(process.cwd(), "bin", "ffmpeg");
+    // Pass the bin/ directory rather than the ffmpeg binary path so yt-dlp
+    // also discovers ffprobe sibling. With just the binary path, yt-dlp
+    // can't find ffprobe and HLS post-processing fails.
+    return path.join(process.cwd(), "bin");
   }
   // Locally, let yt-dlp find ffmpeg on PATH. If it's missing, yt-dlp falls
   // back to the best combined-stream format (usually 360p).
@@ -137,7 +140,7 @@ export async function downloadYouTubeMp4(
 
   return new Promise((resolve) => {
     const qjsBin = resolveQjsBin();
-    const ffmpegBin = resolveFfmpegBin();
+    const ffmpegLocation = resolveFfmpegLocation();
     const proxyUrl = resolveProxyUrl();
     // WNBA recap videos on YouTube expose 720p/1080p only as HLS m3u8
     // streams (no direct https). Through the Decodo residential proxy,
@@ -186,9 +189,16 @@ export async function downloadYouTubeMp4(
       // request, so the actual exit/error info gets dropped. We keep
       // [info]/[error] lines which carry the diagnostics we care about.
       "--no-progress",
+      // Skip yt-dlp's FixupM3u8 step. The default fixup writes a remuxed
+      // temp file alongside the original (in-place "fix"), which doubles
+      // /tmp usage and breaks on 1080p (337 MB × 2 > Vercel's 512 MB /tmp).
+      // The output is still MPEG-TS-in-MP4, which Cloudflare Stream
+      // (Farcaster Stream's backend) ingests fine and re-encodes itself.
+      "--fixup",
+      "never",
       ...(verbose ? ["-v"] : ["--no-warnings"]),
       ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
-      ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
+      ...(ffmpegLocation ? ["--ffmpeg-location", ffmpegLocation] : []),
       ...(proxyUrl ? ["--proxy", proxyUrl] : []),
       "-o",
       tempPath,
