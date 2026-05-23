@@ -15,11 +15,13 @@
  * JavaScript runtime could be found" and falls back to incomplete extraction.
  * Deno would also work but its 110MB binary exceeds GitHub's 100MB limit.
  *
- * Player-client selection: YouTube's default `android_vr` client has been
- * triggering "Sign in to confirm you're not a bot" challenges from cloud IPs
- * (Vercel iad1). We force a non-default rotation that has historically
- * tolerated data-center traffic better. If YT clamps down again, refresh this
- * list (see yt-dlp's youtube extractor source for the current set).
+ * Egress: when DECODO_PROXY is set, yt-dlp routes through a residential
+ * proxy and YouTube's "Sign in to confirm you're not a bot" challenge is
+ * bypassed. We let yt-dlp pick its default player_client(s) so we get the
+ * full DASH manifest (separate video+audio streams up to 1080p). If the
+ * proxy is later removed, expect 360p + bot-challenges to return; the
+ * earlier `youtube:player_client=tv,ios,mweb,android` override was the
+ * datacenter-IP workaround and is no longer needed with the proxy.
  */
 import { spawn } from "child_process";
 import path from "path";
@@ -85,8 +87,6 @@ export async function downloadYouTubeMp4(
         "bv*[height<=1080]+ba/b[height<=1080]",
         "--merge-output-format",
         "mp4",
-        "--extractor-args",
-        "youtube:player_client=tv,ios,mweb,android",
         ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
         ...(proxyUrl ? ["--proxy", proxyUrl] : []),
         "-o",
