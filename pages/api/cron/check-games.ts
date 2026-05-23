@@ -7,7 +7,7 @@ import {
 import type { BoxscorePlayer } from "../../../src/lib/formatter";
 import { findRecapVideoId } from "../../../src/lib/youtube";
 import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
-import { uploadToFarcasterStream } from "../../../src/lib/video";
+import { uploadToFarcasterStream, remuxToMp4Buffer } from "../../../src/lib/video";
 import { formatRecapCast } from "../../../src/lib/formatter";
 import { postToChannel } from "../../../src/lib/neynar";
 import {
@@ -172,16 +172,21 @@ async function processGame(gameId: string): Promise<string> {
     videoFailureReason = `yt-dlp download failed for ${videoId}`;
   } else {
     try {
-      playbackUrl = await uploadToFarcasterStream(
-        { filePath: download.filePath, sizeBytes: download.sizeBytes },
-        gameId
-      );
-      if (!playbackUrl) {
-        videoFailureReason = "farcaster stream upload failed";
+      // The raw HLS download is MPEG-TS-in-MP4 (yt-dlp --fixup never), which
+      // uploads to Cloudflare Stream successfully but the resulting transcode
+      // is broken (m3u8 doesn't play). Remux into a proper fragmented MP4 in
+      // memory before upload; can't use a /tmp file because the 330MB source
+      // plus a same-size output would exceed Vercel's 512MB /tmp budget.
+      const remuxed = await remuxToMp4Buffer(download.filePath);
+      if (!remuxed) {
+        videoFailureReason = "ffmpeg remux to mp4 failed";
+      } else {
+        playbackUrl = await uploadToFarcasterStream(remuxed, gameId);
+        if (!playbackUrl) {
+          videoFailureReason = "farcaster stream upload failed";
+        }
       }
     } finally {
-      // The download returns a tempfile path; we own cleanup after the
-      // upload has either succeeded or failed.
       const { unlink } = await import("fs/promises");
       await unlink(download.filePath).catch(() => {});
     }

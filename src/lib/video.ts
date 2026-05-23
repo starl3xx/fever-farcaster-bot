@@ -1,9 +1,96 @@
+import { spawn } from "child_process";
 import { open, stat } from "fs/promises";
+import path from "path";
 import { fcFetch } from "./farcaster-auth";
 
 export interface VideoFile {
   filePath: string;
   sizeBytes: number;
+}
+
+export interface VideoBuffer {
+  buffer: Buffer;
+  sizeBytes: number;
+}
+
+type VideoSource = VideoFile | VideoBuffer;
+
+function isBufferSource(v: VideoSource): v is VideoBuffer {
+  return "buffer" in v;
+}
+
+function resolveFfmpegBin(): string {
+  if (process.env.YT_DLP_FFMPEG_BIN) return process.env.YT_DLP_FFMPEG_BIN;
+  if (process.env.VERCEL) return path.join(process.cwd(), "bin", "ffmpeg");
+  return "ffmpeg";
+}
+
+/**
+ * Stream-copy remux of an MPEG-TS-in-MP4 file (yt-dlp HLS output with
+ * --fixup never) into a proper streamable MP4, collected in memory. We
+ * can't write to a /tmp temp file because Vercel's /tmp is 512MB and a
+ * 1080p source is ~330MB — there's no room for the output.
+ *
+ * Cloudflare Stream accepts MPEG-TS-in-MP4 uploads but its transcoder
+ * produces a broken stream from them. A proper MP4 input transcodes
+ * cleanly.
+ *
+ * Uses fragmented-MP4 muxing (-movflags empty_moov+frag_keyframe) so
+ * ffmpeg can write to stdout without needing to seek back to update the
+ * moov atom at the end.
+ */
+export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | null> {
+  const ffmpegBin = resolveFfmpegBin();
+  const args = [
+    "-i",
+    filePath,
+    "-c",
+    "copy",
+    "-bsf:a",
+    "aac_adtstoasc",
+    "-f",
+    "mp4",
+    "-movflags",
+    "empty_moov+default_base_moof+frag_keyframe",
+    "pipe:1",
+  ];
+  console.log(`[ffmpeg] Spawning: ${ffmpegBin} ${args.join(" ")}`);
+  const startMs = Date.now();
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    let totalSize = 0;
+    let stderrTail = "";
+
+    proc.stdout.on("data", (chunk: Buffer) => {
+      chunks.push(chunk);
+      totalSize += chunk.length;
+    });
+    proc.stderr.on("data", (chunk: Buffer) => {
+      // Keep only the last 4KB of stderr to surface the actual error
+      // without flooding logs with ffmpeg's normal progress chatter.
+      stderrTail = (stderrTail + chunk.toString()).slice(-4096);
+    });
+
+    proc.on("error", (err) => {
+      console.error("[ffmpeg] Spawn error:", err);
+      resolve(null);
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        console.error(`[ffmpeg] Exited with code ${code}. stderr tail:\n${stderrTail}`);
+        resolve(null);
+        return;
+      }
+      const buffer = Buffer.concat(chunks, totalSize);
+      const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
+      const elapsedSec = ((Date.now() - startMs) / 1000).toFixed(1);
+      console.log(`[ffmpeg] Remuxed ${sizeMB}MB in ${elapsedSec}s`);
+      resolve({ buffer, sizeBytes: buffer.length });
+    });
+  });
 }
 
 /**
@@ -19,12 +106,12 @@ export interface VideoFile {
  * including all the upload-side allocations.
  */
 export async function uploadToFarcasterStream(
-  input: string | VideoFile,
+  input: string | VideoSource,
   _slug: string
 ): Promise<string | null> {
   try {
-    // 1. Resolve to a `VideoFile` on disk.
-    let videoFile: VideoFile;
+    // 1. Resolve to a `VideoSource` (file or buffer).
+    let videoSource: VideoSource;
     if (typeof input === "string") {
       console.log(`[video] Downloading mp4: ${input}`);
       const dlResponse = await fetch(input);
@@ -32,18 +119,17 @@ export async function uploadToFarcasterStream(
         console.error(`[video] Failed to fetch mp4: ${dlResponse.status}`);
         return null;
       }
-      // Old URL-input path. The new in-tree caller passes VideoFile directly,
-      // so this branch only runs for legacy callers. Keeping for back-compat.
-      const bytes = new Uint8Array(await dlResponse.arrayBuffer());
-      const tmpPath = `/tmp/fc-fetch-${Date.now()}.mp4`;
-      const { writeFile } = await import("fs/promises");
-      await writeFile(tmpPath, bytes);
-      videoFile = { filePath: tmpPath, sizeBytes: bytes.length };
-      console.log(`[video] Downloaded ${(bytes.length / 1024 / 1024).toFixed(1)}MB → ${tmpPath}`);
+      const bytes = Buffer.from(await dlResponse.arrayBuffer());
+      videoSource = { buffer: bytes, sizeBytes: bytes.length };
+      console.log(`[video] Downloaded ${(bytes.length / 1024 / 1024).toFixed(1)}MB`);
     } else {
-      videoFile = input;
-      const sizeMB = (videoFile.sizeBytes / 1024 / 1024).toFixed(1);
-      console.log(`[video] Using file ${videoFile.filePath} (${sizeMB}MB)`);
+      videoSource = input;
+      const sizeMB = (videoSource.sizeBytes / 1024 / 1024).toFixed(1);
+      if (isBufferSource(videoSource)) {
+        console.log(`[video] Using in-memory buffer (${sizeMB}MB)`);
+      } else {
+        console.log(`[video] Using file ${videoSource.filePath} (${sizeMB}MB)`);
+      }
     }
 
     // 2. Prepare the upload — get a videoId and TUS upload URL
@@ -52,7 +138,7 @@ export async function uploadToFarcasterStream(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        videoSizeBytes: videoFile.sizeBytes,
+        videoSizeBytes: videoSource.sizeBytes,
         supportsDynamicUpload: true,
       }),
     });
@@ -76,9 +162,9 @@ export async function uploadToFarcasterStream(
     console.log(`[video] Video prepared: ${videoId}`);
 
     // 3. Upload via TUS protocol to the provided upload URL
-    const sizeMB = (videoFile.sizeBytes / 1024 / 1024).toFixed(1);
+    const sizeMB = (videoSource.sizeBytes / 1024 / 1024).toFixed(1);
     console.log(`[video] Uploading ${sizeMB}MB via TUS...`);
-    const uploaded = await tusUpload(uploadUrl, videoFile);
+    const uploaded = await tusUpload(uploadUrl, videoSource);
 
     if (!uploaded) {
       console.error("[video] TUS upload failed");
@@ -161,14 +247,14 @@ const TUS_CHUNK_SIZE = 20 * 1024 * 1024;
  * A single-PATCH streaming body with Transfer-Encoding: chunked (which is
  * what Node fetch does for a Readable body) 502s instantly.
  */
-async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
+async function tusUpload(endpoint: string, source: VideoSource): Promise<boolean> {
   try {
     // TUS creation request — no Content-Type (causes 415 on Farcaster's proxy)
     const createRes = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Tus-Resumable": "1.0.0",
-        "Upload-Length": String(file.sizeBytes),
+        "Upload-Length": String(source.sizeBytes),
         "Upload-Metadata": `filename ${btoa("video.mp4")},filetype ${btoa("video/mp4")}`,
       },
     });
@@ -185,29 +271,41 @@ async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
     }
     console.log(`[video] TUS location: ${location}`);
 
-    // Sanity-check the file is still on disk and at the size we declared.
-    const fresh = await stat(file.filePath);
-    if (fresh.size !== file.sizeBytes) {
-      console.error(
-        `[video] File size changed: expected ${file.sizeBytes}, got ${fresh.size}`
-      );
-      return false;
+    // Read a chunk from either a buffer (in-memory remux output) or a file
+    // on disk. For buffer sources, subarray() is zero-copy.
+    let getChunk: (offset: number, size: number) => Promise<Buffer>;
+    let cleanup: () => Promise<void> = async () => {};
+
+    if (isBufferSource(source)) {
+      getChunk = async (offset, size) =>
+        source.buffer.subarray(offset, offset + size) as Buffer;
+    } else {
+      const fresh = await stat(source.filePath);
+      if (fresh.size !== source.sizeBytes) {
+        console.error(
+          `[video] File size changed: expected ${source.sizeBytes}, got ${fresh.size}`
+        );
+        return false;
+      }
+      const fh = await open(source.filePath, "r");
+      const chunkBuf = Buffer.allocUnsafe(TUS_CHUNK_SIZE);
+      getChunk = async (offset, size) => {
+        const { bytesRead } = await fh.read(chunkBuf, 0, size, offset);
+        if (bytesRead !== size) {
+          throw new Error(`Short read at ${offset}: expected ${size}, got ${bytesRead}`);
+        }
+        return chunkBuf.subarray(0, bytesRead);
+      };
+      cleanup = async () => {
+        await fh.close();
+      };
     }
 
-    // Read + PATCH in 20MB chunks. Reuses a single buffer for all chunks
-    // so memory stays flat throughout the upload.
-    const fh = await open(file.filePath, "r");
     try {
-      const chunkBuf = Buffer.allocUnsafe(TUS_CHUNK_SIZE);
       let offset = 0;
-      while (offset < file.sizeBytes) {
-        const bytesToRead = Math.min(TUS_CHUNK_SIZE, file.sizeBytes - offset);
-        const { bytesRead } = await fh.read(chunkBuf, 0, bytesToRead, offset);
-        if (bytesRead === 0) {
-          console.error(`[video] TUS unexpected EOF at offset ${offset}`);
-          return false;
-        }
-        const chunk = chunkBuf.subarray(0, bytesRead);
+      while (offset < source.sizeBytes) {
+        const bytesToRead = Math.min(TUS_CHUNK_SIZE, source.sizeBytes - offset);
+        const chunk = await getChunk(offset, bytesToRead);
 
         const patchRes = await fetch(location, {
           method: "PATCH",
@@ -215,28 +313,28 @@ async function tusUpload(endpoint: string, file: VideoFile): Promise<boolean> {
             "Tus-Resumable": "1.0.0",
             "Upload-Offset": String(offset),
             "Content-Type": "application/offset+octet-stream",
-            "Content-Length": String(bytesRead),
+            "Content-Length": String(bytesToRead),
           },
           body: chunk as unknown as BodyInit,
         });
 
         if (patchRes.status !== 204 && !patchRes.ok) {
           console.error(
-            `[video] TUS PATCH @${offset} (${bytesRead}b) failed: ${patchRes.status} ${await patchRes.text()}`
+            `[video] TUS PATCH @${offset} (${bytesToRead}b) failed: ${patchRes.status} ${await patchRes.text()}`
           );
           return false;
         }
 
-        offset += bytesRead;
-        const pct = ((offset / file.sizeBytes) * 100).toFixed(1);
+        offset += bytesToRead;
+        const pct = ((offset / source.sizeBytes) * 100).toFixed(1);
         console.log(
-          `[video] TUS uploaded ${pct}% (${offset}/${file.sizeBytes})`
+          `[video] TUS uploaded ${pct}% (${offset}/${source.sizeBytes})`
         );
       }
       console.log("[video] TUS upload succeeded");
       return true;
     } finally {
-      await fh.close();
+      await cleanup();
     }
   } catch (err) {
     console.error("[video] TUS upload error:", err);
