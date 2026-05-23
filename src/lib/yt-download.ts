@@ -139,14 +139,17 @@ export async function downloadYouTubeMp4(
     const qjsBin = resolveQjsBin();
     const ffmpegBin = resolveFfmpegBin();
     const proxyUrl = resolveProxyUrl();
-    // Prefer mp4-container h264 video + m4a AAC audio so ffmpeg can stream-
-    // copy (no re-encode). Falls back to best-of-anything (may transcode) and
-    // finally to a single combined stream (usually 360p) if DASH isn't
-    // reachable through the proxy.
+    // WNBA recap videos on YouTube expose 720p/1080p only as HLS m3u8
+    // streams (no direct https). Through the Decodo residential proxy,
+    // parallel HLS fragment downloads against one sticky IP trigger
+    // Cloudflare 522 retry storms, so we cap at 720p (~149MB) and download
+    // serially. The selector still prefers h264+aac so ffmpeg stream-copies.
+    // Override the cap with YT_DLP_MAX_HEIGHT (e.g. "1080") to retest 1080p.
+    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "720";
     const formatSelector =
-      "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/" +
-      "bv*[height<=1080]+ba/" +
-      "b[height<=1080]";
+      `bv*[height<=${maxHeight}][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/` +
+      `bv*[height<=${maxHeight}]+ba/` +
+      `b[height<=${maxHeight}]`;
 
     const verbose = process.env.YT_DLP_VERBOSE === "1";
     const args = [
@@ -154,8 +157,6 @@ export async function downloadYouTubeMp4(
       formatSelector,
       "--merge-output-format",
       "mp4",
-      "--concurrent-fragments",
-      "4",
       "--socket-timeout",
       "30",
       "--newline", // progress on new lines so we can stream-parse stderr
