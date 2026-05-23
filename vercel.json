@@ -4,7 +4,7 @@
   ],
   "functions": {
     "pages/api/cron/check-games.ts": {
-      "maxDuration": 300,
+      "maxDuration": 600,
       "includeFiles": "bin/**"
     }
   }
