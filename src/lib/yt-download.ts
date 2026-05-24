@@ -154,6 +154,23 @@ export async function downloadYouTubeMp4(
   const url = `https://youtube.com/watch?v=${videoId}`;
   const tempPath = path.join(os.tmpdir(), `recap-${videoId}-${Date.now()}.mp4`);
 
+  // Sweep orphaned recap-*.mp4 files from previous invocations. Vercel reuses
+  // function instances warmly across cron ticks, so /tmp persists across runs.
+  // If an earlier invocation was SIGKILLed (OOM, timeout) before its cleanup
+  // ran, its 100-300MB source file is still on disk and we hit ENOSPC on the
+  // next download. Vercel's /tmp is only 512MB; one orphan is fatal.
+  try {
+    const tmpDir = os.tmpdir();
+    const entries = await fs.readdir(tmpDir);
+    for (const name of entries) {
+      if (name.startsWith("recap-") && name.endsWith(".mp4")) {
+        await fs.unlink(path.join(tmpDir, name)).catch(() => {});
+      }
+    }
+  } catch (err) {
+    console.warn("[yt-dlp] tmp sweep failed (non-fatal):", err);
+  }
+
   return new Promise((resolve) => {
     const qjsBin = resolveQjsBin();
     const ffmpegLocation = resolveFfmpegLocation();
