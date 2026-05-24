@@ -48,13 +48,14 @@ export async function remuxToMp4Buffer(filePath: string): Promise<VideoBuffer | 
     // transcoder failed on (500 errors during transcode, regardless of
     // container format: fragmented MP4 or MKV). The H.264 stream from
     // HLS MPEG-TS has framing quirks that confuse Cloudflare's pipeline.
-    // libx264 at preset=veryfast on 10 min of 1080p takes ~2-3 min of CPU
-    // time, well within Vercel's 600s function budget. crf 23 is the
-    // standard "visually lossless" quality target.
+    // libx264 at preset=ultrafast keeps 10 min of 1080p well under the
+    // Vercel 600s function budget — `veryfast` was timing out at 600s.
+    // ultrafast trades ~30% larger output for ~2-3x faster encode; the
+    // larger file still fits the 2GB function memory + TUS upload budget.
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast",
+    "ultrafast",
     "-crf",
     "23",
     "-c:a",
