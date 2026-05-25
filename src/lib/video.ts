@@ -183,9 +183,22 @@ function trackFfmpegExit(proc: FfmpegProc): Promise<number> {
 /**
  * TUS PATCH chunk size. Cloudflare Stream rejects chunked-encoding bodies
  * (502), so each PATCH must be a fixed-size, single-shot body. 20MB
- * balances HTTP overhead against the per-chunk memory footprint.
+ * balances HTTP overhead against the per-chunk memory footprint, and is
+ * a multiple of TUS_ALIGN (Cloudflare's required 256KiB alignment).
  */
 const TUS_CHUNK_SIZE = 20 * 1024 * 1024;
+
+/**
+ * Cloudflare Stream's TUS endpoint rejects any PATCH whose body length is
+ * not a multiple of 256 KiB (`Non-256KiB chunk size multiple`, error 10031),
+ * even when Upload-Length is declared on that same PATCH via the deferred-
+ * length extension. The final encoded chunk is almost never a clean
+ * multiple, so we zero-pad it up to the next 256 KiB boundary. Matroska's
+ * demuxer (and Cloudflare's transcoder by extension) ignores bytes after
+ * the last valid Segment element, so the padding is silently dropped on
+ * decode.
+ */
+const TUS_ALIGN = 256 * 1024;
 
 /**
  * Read exactly `size` bytes from a Readable, returning a Buffer of that
@@ -274,33 +287,18 @@ async function tusUploadStream(
     while (true) {
       const { buf, eof } = await readExactly(stream, TUS_CHUNK_SIZE);
 
-      // Three cases:
-      //   1. full chunk, more data coming  → normal PATCH
-      //   2. full chunk, exactly EOF        → normal PATCH, then EOF PATCH with Upload-Length
-      //   3. partial chunk, EOF             → final PATCH carrying Upload-Length
-      // We collapse cases 2 and 3 by treating any EOF (including with a full
-      // 20MB tail) the same way: send what we have with Upload-Length, then
-      // send an empty terminator only if the tail was exactly 20MB AND we
-      // haven't already declared length.
-
-      const isFinalDataChunk = eof; // no more bytes will come after this buffer
-      const headers: Record<string, string> = {
-        "Tus-Resumable": "1.0.0",
-        "Upload-Offset": String(offset),
-        "Content-Type": "application/offset+octet-stream",
-        "Content-Length": String(buf.length),
-      };
-      if (isFinalDataChunk) {
-        headers["Upload-Length"] = String(offset + buf.length);
-      }
-
-      if (buf.length > 0) {
+      if (!eof) {
+        // Full 20MB chunk with more data coming — straight PATCH.
         const patchRes = await fetch(location, {
           method: "PATCH",
-          headers,
+          headers: {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": String(offset),
+            "Content-Type": "application/offset+octet-stream",
+            "Content-Length": String(buf.length),
+          },
           body: buf as unknown as BodyInit,
         });
-
         if (patchRes.status !== 204 && !patchRes.ok) {
           console.error(
             `[video] TUS PATCH @${offset} (${buf.length}b) failed: ${patchRes.status} ${await patchRes.text()}`
@@ -310,38 +308,73 @@ async function tusUploadStream(
         offset += buf.length;
 
         const now = Date.now();
-        if (now - lastProgressLog > 5000 || isFinalDataChunk) {
+        if (now - lastProgressLog > 5000) {
           const mb = (offset / 1024 / 1024).toFixed(1);
           console.log(`[video] TUS uploaded ${mb}MB`);
           lastProgressLog = now;
         }
+        continue;
       }
 
-      if (isFinalDataChunk) {
-        // If buf.length was 0 (stream closed at an exact boundary), we still
-        // need to declare the total length to TUS. Send an empty PATCH with
-        // Upload-Length so the server knows the upload is complete.
-        if (buf.length === 0) {
-          const finishRes = await fetch(location, {
-            method: "PATCH",
-            headers: {
-              "Tus-Resumable": "1.0.0",
-              "Upload-Offset": String(offset),
-              "Upload-Length": String(offset),
-              "Content-Type": "application/offset+octet-stream",
-              "Content-Length": "0",
-            },
-          });
-          if (finishRes.status !== 204 && !finishRes.ok) {
-            console.error(
-              `[video] TUS finalize failed: ${finishRes.status} ${await finishRes.text()}`
-            );
-            return null;
-          }
+      // EOF reached. `buf` is the final tail (may be 0..TUS_CHUNK_SIZE bytes).
+      // Pad up to the next 256 KiB boundary so Cloudflare accepts the chunk,
+      // then declare Upload-Length = padded total. The trailing zeros land
+      // after Matroska's last Segment element and are silently ignored on
+      // decode.
+      const realTail = buf.length;
+      const paddedLen =
+        realTail === 0 ? 0 : Math.ceil(realTail / TUS_ALIGN) * TUS_ALIGN;
+      const totalLength = offset + paddedLen;
+
+      if (paddedLen === 0) {
+        // Exact boundary EOF — no tail to send. Just finalize with empty PATCH.
+        const finishRes = await fetch(location, {
+          method: "PATCH",
+          headers: {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": String(offset),
+            "Upload-Length": String(offset),
+            "Content-Type": "application/offset+octet-stream",
+            "Content-Length": "0",
+          },
+        });
+        if (finishRes.status !== 204 && !finishRes.ok) {
+          console.error(
+            `[video] TUS finalize failed: ${finishRes.status} ${await finishRes.text()}`
+          );
+          return null;
         }
-        console.log(`[video] TUS upload succeeded (${offset} bytes total)`);
+        console.log(`[video] TUS upload succeeded (${offset} bytes, no tail)`);
         return offset;
       }
+
+      const padded =
+        paddedLen === realTail
+          ? buf
+          : Buffer.concat([buf, Buffer.alloc(paddedLen - realTail)], paddedLen);
+
+      const patchRes = await fetch(location, {
+        method: "PATCH",
+        headers: {
+          "Tus-Resumable": "1.0.0",
+          "Upload-Offset": String(offset),
+          "Upload-Length": String(totalLength),
+          "Content-Type": "application/offset+octet-stream",
+          "Content-Length": String(paddedLen),
+        },
+        body: padded as unknown as BodyInit,
+      });
+
+      if (patchRes.status !== 204 && !patchRes.ok) {
+        console.error(
+          `[video] TUS final PATCH @${offset} (${paddedLen}b, ${realTail} real + ${paddedLen - realTail} pad) failed: ${patchRes.status} ${await patchRes.text()}`
+        );
+        return null;
+      }
+      console.log(
+        `[video] TUS upload succeeded (${totalLength} bytes; ${realTail} real tail + ${paddedLen - realTail} zero pad)`
+      );
+      return totalLength;
     }
   } catch (err) {
     console.error("[video] TUS upload error:", err);
