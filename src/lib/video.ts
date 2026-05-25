@@ -1,10 +1,8 @@
-import { spawn, ChildProcessByStdio } from "child_process";
-import { stat } from "fs/promises";
+import { spawn } from "child_process";
+import { open, stat, unlink } from "fs/promises";
 import path from "path";
-import { Readable } from "stream";
+import os from "os";
 import { fcFetch } from "./farcaster-auth";
-
-type FfmpegProc = ChildProcessByStdio<null, Readable, Readable>;
 
 function resolveFfmpegBin(): string {
   if (process.env.YT_DLP_FFMPEG_BIN) return process.env.YT_DLP_FFMPEG_BIN;
@@ -13,96 +11,125 @@ function resolveFfmpegBin(): string {
 }
 
 /**
- * Spawn ffmpeg to remux+transcode the yt-dlp HLS download into a clean
- * Matroska stream on stdout. Returns the child process so the caller can
- * pipe stdout directly into TUS PATCH chunks — we never buffer the full
- * encoded output in memory, which is the only way 1080p fits Vercel's 2GB
- * function ceiling. ultrafast 1080p crf 23 produces 1.5-2GB of output for
- * a 10-min source, and Buffer.concat doubled it during accumulation.
+ * Encode the yt-dlp HLS download into a clean Matroska file on disk.
  *
- * Cloudflare Stream rejected stream-copied MPEG-TS-in-MP4 sources (their
- * transcoder 500s) regardless of container, so we re-encode H.264+AAC into
- * MKV. MKV is the only container we tested that Cloudflare accepts AND
- * that ffmpeg can write to a non-seekable pipe.
+ * We can't pipe ffmpeg's output straight into TUS PATCH chunks because
+ * Cloudflare Stream rejects PATCH bodies that aren't 256 KiB multiples
+ * (error 10031). The last chunk is exempt only when `Upload-Length` is
+ * declared upfront on the TUS CREATE — which means we need to know the
+ * encoded size *before* uploading, which means writing to disk.
+ *
+ * That puts us inside two budgets at once: Vercel's /tmp is capped at
+ * 512 MB, and the 330 MB yt-dlp source occupies most of it. To leave room
+ * for the encoded output we downscale to 720p and cap video bitrate at
+ * 2 Mbps — produces ~150 MB output, leaving ~30 MB /tmp headroom.
+ * (Farcaster also rejects uploads over 1 GB, so we'd be capping bitrate
+ * regardless.)
+ *
+ * Cloudflare's transcoder 500s on stream-copied MPEG-TS-in-MP4 sources,
+ * so we re-encode H.264+AAC into MKV. MKV's streaming-friendly framing
+ * survives a TUS upload, and the encoder's exact-size output means we
+ * never need to pad anything.
  */
-function spawnRemuxProc(filePath: string): FfmpegProc {
+async function encodeToFile(
+  sourcePath: string,
+  outPath: string
+): Promise<boolean> {
   const ffmpegBin = resolveFfmpegBin();
-  // Bitrate-capped encode rather than CRF: Farcaster's prepare-video-upload
-  // rejects videos over 1GB ("Video needs to be under 1GB"), and ultrafast
-  // crf 23 at 1080p routinely overshoots that. -b:v 4M with -maxrate 5M
-  // produces ~300-400MB for a 10-min recap (4 Mbps × 600s = 300MB), close
-  // to the source quality and comfortably under the 1GB ceiling.
   const args = [
     "-i",
-    filePath,
+    sourcePath,
+    "-vf",
+    "scale=-2:720",
     "-c:v",
     "libx264",
     "-preset",
     "ultrafast",
     "-b:v",
-    "4M",
+    "2M",
     "-maxrate",
-    "5M",
+    "2.5M",
     "-bufsize",
-    "8M",
+    "5M",
     "-c:a",
     "aac",
     "-b:a",
     "128k",
     "-f",
     "matroska",
-    "pipe:1",
+    "-y",
+    outPath,
   ];
   console.log(`[ffmpeg] Spawning: ${ffmpegBin} ${args.join(" ")}`);
-  return spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const startMs = Date.now();
+
+  return new Promise((resolve) => {
+    const proc = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderrTail = "";
+
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-4096);
+    });
+    proc.on("error", (err) => {
+      console.error("[ffmpeg] Spawn error:", err);
+      resolve(false);
+    });
+    proc.on("close", (code) => {
+      const elapsedSec = ((Date.now() - startMs) / 1000).toFixed(1);
+      if (code !== 0) {
+        console.error(`[ffmpeg] Exited with code ${code} after ${elapsedSec}s. stderr tail:\n${stderrTail}`);
+        resolve(false);
+        return;
+      }
+      console.log(`[ffmpeg] Encoded successfully in ${elapsedSec}s`);
+      resolve(true);
+    });
+  });
 }
 
 /**
- * Upload the recap to Farcaster's video infrastructure by streaming a fresh
- * ffmpeg transcode directly into the TUS upload — no on-disk or in-memory
- * accumulation of encoded output. Returns the playback URL that renders as
- * native video in Farcaster clients, or null on any pipeline failure.
+ * Upload the recap to Farcaster's video infrastructure. Returns the
+ * playback URL that renders as native video in Farcaster clients, or null
+ * on any pipeline failure.
  *
- * The flow:
- *   1. prepare-video-upload (Farcaster) with a generous size upper bound so
- *      the backend doesn't reject the upload on quota grounds. The TUS
- *      protocol's deferred-length extension is what actually carries the
- *      true byte count once ffmpeg exits.
- *   2. TUS CREATE with `Upload-Defer-Length: 1` (no Upload-Length yet).
- *   3. Stream ffmpeg stdout in 20MB chunks, PATCH each one. On the final
- *      chunk we attach `Upload-Length` so TUS knows the upload is complete.
- *   4. Poll the videoId until Farcaster's pipeline produces an embed URL,
- *      then wait briefly for the embed classifier to index it.
+ * Flow:
+ *   1. ffmpeg-encode source → /tmp/encoded-*.mkv (bitrate-capped, fits /tmp)
+ *   2. prepare-video-upload (Farcaster) — get videoId + TUS endpoint
+ *   3. TUS upload from /tmp/encoded-*.mkv in 20 MB chunks
+ *   4. Poll until Farcaster's pipeline produces an embed URL
+ *   5. Wait briefly for the embed classifier to index it
  */
 export async function uploadRemuxedToFarcasterStream(
   sourceFilePath: string,
   _slug: string
 ): Promise<string | null> {
-  let proc: FfmpegProc | null = null;
+  const encodedPath = path.join(
+    os.tmpdir(),
+    `encoded-${Date.now()}.mkv`
+  );
 
   try {
-    const sourceStat = await stat(sourceFilePath);
-    const sourceMB = (sourceStat.size / 1024 / 1024).toFixed(1);
-    console.log(`[video] Source ${sourceFilePath} (${sourceMB}MB)`);
+    const encodeOk = await encodeToFile(sourceFilePath, encodedPath);
+    if (!encodeOk) return null;
 
-    // Upper bound for prepare-video-upload. Farcaster rejects >1GB, and our
-    // bitrate-capped encode produces ~300-500MB for a 10-min recap. Send
-    // 900MB so we're safely under the limit while leaving room for variance.
-    const estimatedSize = 900_000_000;
+    const encodedStat = await stat(encodedPath);
+    const sizeMB = (encodedStat.size / 1024 / 1024).toFixed(1);
+    console.log(`[video] Encoded output: ${sizeMB}MB at ${encodedPath}`);
 
     console.log("[video] Preparing Farcaster video upload...");
     const prepareRes = await fcFetch("/v1/prepare-video-upload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        videoSizeBytes: estimatedSize,
+        videoSizeBytes: encodedStat.size,
         supportsDynamicUpload: true,
       }),
     });
 
     if (!prepareRes.ok) {
-      const errText = await prepareRes.text();
-      console.error(`[video] prepare-video-upload failed: ${prepareRes.status} ${errText}`);
+      console.error(
+        `[video] prepare-video-upload failed: ${prepareRes.status} ${await prepareRes.text()}`
+      );
       return null;
     }
 
@@ -118,23 +145,13 @@ export async function uploadRemuxedToFarcasterStream(
 
     console.log(`[video] Video prepared: ${videoId}`);
 
-    proc = spawnRemuxProc(sourceFilePath);
-    const ffmpegDone = trackFfmpegExit(proc);
-
-    const totalBytes = await tusUploadStream(uploadUrl, proc.stdout);
-    if (totalBytes === null) {
-      console.error("[video] Streaming TUS upload failed");
+    const uploaded = await tusUploadFile(uploadUrl, encodedPath, encodedStat.size);
+    if (!uploaded) {
+      console.error("[video] TUS upload failed");
       return null;
     }
 
-    const ffmpegExitCode = await ffmpegDone;
-    if (ffmpegExitCode !== 0) {
-      console.error(`[video] ffmpeg exited with code ${ffmpegExitCode}`);
-      return null;
-    }
-
-    const uploadedMB = (totalBytes / 1024 / 1024).toFixed(1);
-    console.log(`[video] Upload complete (${uploadedMB}MB), waiting for processing...`);
+    console.log("[video] Upload complete, waiting for processing...");
 
     const embedUrl = await pollForReady(videoId);
 
@@ -151,234 +168,95 @@ export async function uploadRemuxedToFarcasterStream(
     console.error("[video] Farcaster video upload failed:", err);
     return null;
   } finally {
-    if (proc && !proc.killed) {
-      proc.kill("SIGKILL");
-    }
+    await unlink(encodedPath).catch(() => {});
   }
 }
 
 /**
- * Resolve to the exit code once ffmpeg closes. Keeps the last 4KB of stderr
- * for diagnostics — full stderr would flood logs with progress chatter.
- */
-function trackFfmpegExit(proc: FfmpegProc): Promise<number> {
-  let stderrTail = "";
-  proc.stderr.on("data", (chunk: Buffer) => {
-    stderrTail = (stderrTail + chunk.toString()).slice(-4096);
-  });
-  return new Promise((resolve) => {
-    proc.on("error", (err) => {
-      console.error("[ffmpeg] Spawn error:", err);
-      resolve(-1);
-    });
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        console.error(`[ffmpeg] Exited with code ${code}. stderr tail:\n${stderrTail}`);
-      }
-      resolve(code ?? -1);
-    });
-  });
-}
-
-/**
  * TUS PATCH chunk size. Cloudflare Stream rejects chunked-encoding bodies
- * (502), so each PATCH must be a fixed-size, single-shot body. 20MB
- * balances HTTP overhead against the per-chunk memory footprint, and is
- * a multiple of TUS_ALIGN (Cloudflare's required 256KiB alignment).
+ * (502), so each PATCH must be a fixed-length, single-shot body. 20 MB
+ * balances HTTP overhead against per-chunk memory footprint and is a
+ * multiple of Cloudflare's required 256 KiB alignment. The very last
+ * PATCH is allowed to be smaller because Upload-Length is declared on
+ * CREATE — Cloudflare knows which chunk is final and exempts it.
  */
 const TUS_CHUNK_SIZE = 20 * 1024 * 1024;
 
 /**
- * Cloudflare Stream's TUS endpoint rejects any PATCH whose body length is
- * not a multiple of 256 KiB (`Non-256KiB chunk size multiple`, error 10031),
- * even when Upload-Length is declared on that same PATCH via the deferred-
- * length extension. The final encoded chunk is almost never a clean
- * multiple, so we zero-pad it up to the next 256 KiB boundary. Matroska's
- * demuxer (and Cloudflare's transcoder by extension) ignores bytes after
- * the last valid Segment element, so the padding is silently dropped on
- * decode.
+ * Upload a file to Cloudflare Stream via TUS. Upload-Length is declared
+ * on the CREATE request, so Cloudflare exempts the natural final partial
+ * chunk from its 256 KiB-multiple rule.
  */
-const TUS_ALIGN = 256 * 1024;
-
-/**
- * Read exactly `size` bytes from a Readable, returning a Buffer of that
- * length. If the stream ends before `size` bytes accumulate, returns
- * `{ buf, eof: true }` with the partial buffer (possibly empty).
- */
-async function readExactly(
-  stream: Readable,
-  size: number
-): Promise<{ buf: Buffer; eof: boolean }> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let collected = 0;
-
-    const onReadable = () => {
-      while (collected < size) {
-        const remaining = size - collected;
-        const chunk = stream.read(remaining) as Buffer | null;
-        if (chunk === null) return; // wait for more
-        chunks.push(chunk);
-        collected += chunk.length;
-      }
-      cleanup();
-      resolve({ buf: Buffer.concat(chunks, collected), eof: false });
-    };
-    const onEnd = () => {
-      cleanup();
-      resolve({ buf: Buffer.concat(chunks, collected), eof: true });
-    };
-    const onError = (err: Error) => {
-      cleanup();
-      reject(err);
-    };
-    const cleanup = () => {
-      stream.off("readable", onReadable);
-      stream.off("end", onEnd);
-      stream.off("error", onError);
-    };
-
-    stream.on("readable", onReadable);
-    stream.on("end", onEnd);
-    stream.on("error", onError);
-
-    // Kick the read in case data was already buffered before listeners attached.
-    onReadable();
-  });
-}
-
-/**
- * Stream-upload a Readable to Cloudflare Stream via TUS, declaring the
- * total length on the final PATCH (deferred-length extension). Returns the
- * total uploaded byte count, or null on failure.
- */
-async function tusUploadStream(
+async function tusUploadFile(
   endpoint: string,
-  stream: Readable
-): Promise<number | null> {
+  filePath: string,
+  sizeBytes: number
+): Promise<boolean> {
+  const createRes = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Tus-Resumable": "1.0.0",
+      "Upload-Length": String(sizeBytes),
+      "Upload-Metadata": `filename ${btoa("video.mkv")},filetype ${btoa("video/x-matroska")}`,
+    },
+  });
+
+  if (createRes.status !== 201 && !createRes.ok) {
+    console.error(
+      `[video] TUS create failed: ${createRes.status} ${await createRes.text()}`
+    );
+    return false;
+  }
+
+  const location = createRes.headers.get("location");
+  if (!location) {
+    console.error("[video] TUS create returned no Location header");
+    return false;
+  }
+  console.log(`[video] TUS location: ${location}`);
+
+  const fh = await open(filePath, "r");
+  const chunkBuf = Buffer.allocUnsafe(TUS_CHUNK_SIZE);
+
   try {
-    // CREATE with Upload-Defer-Length: 1 — we don't know the encoded size yet.
-    const createRes = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Tus-Resumable": "1.0.0",
-        "Upload-Defer-Length": "1",
-        "Upload-Metadata": `filename ${btoa("video.mkv")},filetype ${btoa("video/x-matroska")}`,
-      },
-    });
-
-    if (createRes.status !== 201 && !createRes.ok) {
-      console.error(
-        `[video] TUS create failed: ${createRes.status} ${await createRes.text()}`
-      );
-      return null;
-    }
-
-    const location = createRes.headers.get("location");
-    if (!location) {
-      console.error("[video] TUS create returned no Location header");
-      return null;
-    }
-    console.log(`[video] TUS location: ${location}`);
-
     let offset = 0;
-    let lastProgressLog = Date.now();
-
-    while (true) {
-      const { buf, eof } = await readExactly(stream, TUS_CHUNK_SIZE);
-
-      if (!eof) {
-        // Full 20MB chunk with more data coming — straight PATCH.
-        const patchRes = await fetch(location, {
-          method: "PATCH",
-          headers: {
-            "Tus-Resumable": "1.0.0",
-            "Upload-Offset": String(offset),
-            "Content-Type": "application/offset+octet-stream",
-            "Content-Length": String(buf.length),
-          },
-          body: buf as unknown as BodyInit,
-        });
-        if (patchRes.status !== 204 && !patchRes.ok) {
-          console.error(
-            `[video] TUS PATCH @${offset} (${buf.length}b) failed: ${patchRes.status} ${await patchRes.text()}`
-          );
-          return null;
-        }
-        offset += buf.length;
-
-        const now = Date.now();
-        if (now - lastProgressLog > 5000) {
-          const mb = (offset / 1024 / 1024).toFixed(1);
-          console.log(`[video] TUS uploaded ${mb}MB`);
-          lastProgressLog = now;
-        }
-        continue;
+    while (offset < sizeBytes) {
+      const bytesToRead = Math.min(TUS_CHUNK_SIZE, sizeBytes - offset);
+      const { bytesRead } = await fh.read(chunkBuf, 0, bytesToRead, offset);
+      if (bytesRead !== bytesToRead) {
+        console.error(
+          `[video] Short read at offset ${offset}: expected ${bytesToRead}, got ${bytesRead}`
+        );
+        return false;
       }
-
-      // EOF reached. `buf` is the final tail (may be 0..TUS_CHUNK_SIZE bytes).
-      // Pad up to the next 256 KiB boundary so Cloudflare accepts the chunk,
-      // then declare Upload-Length = padded total. The trailing zeros land
-      // after Matroska's last Segment element and are silently ignored on
-      // decode.
-      const realTail = buf.length;
-      const paddedLen =
-        realTail === 0 ? 0 : Math.ceil(realTail / TUS_ALIGN) * TUS_ALIGN;
-      const totalLength = offset + paddedLen;
-
-      if (paddedLen === 0) {
-        // Exact boundary EOF — no tail to send. Just finalize with empty PATCH.
-        const finishRes = await fetch(location, {
-          method: "PATCH",
-          headers: {
-            "Tus-Resumable": "1.0.0",
-            "Upload-Offset": String(offset),
-            "Upload-Length": String(offset),
-            "Content-Type": "application/offset+octet-stream",
-            "Content-Length": "0",
-          },
-        });
-        if (finishRes.status !== 204 && !finishRes.ok) {
-          console.error(
-            `[video] TUS finalize failed: ${finishRes.status} ${await finishRes.text()}`
-          );
-          return null;
-        }
-        console.log(`[video] TUS upload succeeded (${offset} bytes, no tail)`);
-        return offset;
-      }
-
-      const padded =
-        paddedLen === realTail
-          ? buf
-          : Buffer.concat([buf, Buffer.alloc(paddedLen - realTail)], paddedLen);
+      const chunk = chunkBuf.subarray(0, bytesRead);
 
       const patchRes = await fetch(location, {
         method: "PATCH",
         headers: {
           "Tus-Resumable": "1.0.0",
           "Upload-Offset": String(offset),
-          "Upload-Length": String(totalLength),
           "Content-Type": "application/offset+octet-stream",
-          "Content-Length": String(paddedLen),
+          "Content-Length": String(bytesToRead),
         },
-        body: padded as unknown as BodyInit,
+        body: chunk as unknown as BodyInit,
       });
 
       if (patchRes.status !== 204 && !patchRes.ok) {
         console.error(
-          `[video] TUS final PATCH @${offset} (${paddedLen}b, ${realTail} real + ${paddedLen - realTail} pad) failed: ${patchRes.status} ${await patchRes.text()}`
+          `[video] TUS PATCH @${offset} (${bytesToRead}b) failed: ${patchRes.status} ${await patchRes.text()}`
         );
-        return null;
+        return false;
       }
-      console.log(
-        `[video] TUS upload succeeded (${totalLength} bytes; ${realTail} real tail + ${paddedLen - realTail} zero pad)`
-      );
-      return totalLength;
+
+      offset += bytesToRead;
+      const pct = ((offset / sizeBytes) * 100).toFixed(1);
+      console.log(`[video] TUS uploaded ${pct}% (${offset}/${sizeBytes})`);
     }
-  } catch (err) {
-    console.error("[video] TUS upload error:", err);
-    return null;
+    console.log("[video] TUS upload succeeded");
+    return true;
+  } finally {
+    await fh.close();
   }
 }
 
@@ -436,8 +314,6 @@ async function pollForReady(videoId: string): Promise<string | null> {
       const video = data.result?.video;
       const embed = video?.embed;
 
-      // Prefer `url` (canonical stream.farcaster.xyz URL the classifier
-      // indexes) over `sourceUrl` (raw Cloudflare Stream URL).
       if (embed?.url || embed?.sourceUrl) {
         const embedUrl = embed.url || embed.sourceUrl;
         console.log(`[video] Video ready! Embed URL: ${embedUrl}`);
