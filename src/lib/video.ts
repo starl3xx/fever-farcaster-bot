@@ -20,11 +20,13 @@ function resolveFfmpegBin(): string {
  * encoded size *before* uploading, which means writing to disk.
  *
  * That puts us inside two budgets at once: Vercel's /tmp is capped at
- * 512 MB, and the 330 MB yt-dlp source occupies most of it. To leave room
- * for the encoded output we downscale to 720p and cap video bitrate at
- * 2 Mbps — produces ~150 MB output, leaving ~30 MB /tmp headroom.
+ * 512 MB, and the 330 MB yt-dlp source plus ~50 MB of PyInstaller cache
+ * leave only ~130 MB headroom. To stay safely inside, we downscale to
+ * 720p and cap video bitrate at 1 Mbps — produces ~75 MB encoded output.
  * (Farcaster also rejects uploads over 1 GB, so we'd be capping bitrate
- * regardless.)
+ * regardless.) Higher quality requires a streaming yt-dlp → ffmpeg pipe
+ * that doesn't land the source on /tmp at all — a worthwhile refactor
+ * once the basic pipeline is stable.
  *
  * Cloudflare's transcoder 500s on stream-copied MPEG-TS-in-MP4 sources,
  * so we re-encode H.264+AAC into MKV. MKV's streaming-friendly framing
@@ -46,11 +48,11 @@ async function encodeToFile(
     "-preset",
     "ultrafast",
     "-b:v",
-    "2M",
+    "1M",
     "-maxrate",
-    "2.5M",
+    "1.3M",
     "-bufsize",
-    "5M",
+    "2M",
     "-c:a",
     "aac",
     "-b:a",

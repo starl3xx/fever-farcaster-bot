@@ -154,17 +154,27 @@ export async function downloadYouTubeMp4(
   const url = `https://youtube.com/watch?v=${videoId}`;
   const tempPath = path.join(os.tmpdir(), `recap-${videoId}-${Date.now()}.mp4`);
 
-  // Sweep orphaned recap-*.mp4 files from previous invocations. Vercel reuses
-  // function instances warmly across cron ticks, so /tmp persists across runs.
-  // If an earlier invocation was SIGKILLed (OOM, timeout) before its cleanup
-  // ran, its 100-300MB source file is still on disk and we hit ENOSPC on the
-  // next download. Vercel's /tmp is only 512MB; one orphan is fatal.
+  // Sweep orphans from previous invocations. Vercel reuses function instances
+  // warmly across cron ticks, so /tmp persists across runs. An earlier SIGKILL
+  // or ENOSPC crash can leave:
+  //   - recap-*.mp4: 100-300MB yt-dlp source files
+  //   - encoded-*.mkv: 50-150MB ffmpeg outputs from the upload step
+  //   - _MEI*/ directories: PyInstaller's partial yt-dlp extraction; if the
+  //     prior crash truncated this, the next yt-dlp launch fails with
+  //     "Failed to extract curl_cffi/..." until the dir is rebuilt
+  // /tmp is only 512MB on Vercel; any orphan is fatal.
   try {
     const tmpDir = os.tmpdir();
     const entries = await fs.readdir(tmpDir);
     for (const name of entries) {
-      if (name.startsWith("recap-") && name.endsWith(".mp4")) {
-        await fs.unlink(path.join(tmpDir, name)).catch(() => {});
+      const full = path.join(tmpDir, name);
+      if (
+        (name.startsWith("recap-") && name.endsWith(".mp4")) ||
+        (name.startsWith("encoded-") && name.endsWith(".mkv"))
+      ) {
+        await fs.unlink(full).catch(() => {});
+      } else if (name.startsWith("_MEI")) {
+        await fs.rm(full, { recursive: true, force: true }).catch(() => {});
       }
     }
   } catch (err) {
