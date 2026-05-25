@@ -57,13 +57,14 @@ async function encodeToFile(
     "aac",
     "-b:a",
     "128k",
-    // MP4 with faststart: moov atom rewritten to the front of the file so
-    // Cloudflare Stream's transcoder can start reading without seeking
-    // through the whole file. We tried MKV first (a streaming-friendly
-    // container) but Cloudflare's transcoder returned 424 on the resulting
-    // manifest — the same code path produces valid HLS from MP4 inputs.
+    // Fragmented MP4 instead of `+faststart`: faststart needs to rewrite
+    // the entire file at end-of-encode to move the moov atom to the front,
+    // which doubles peak /tmp use (write 78MB → rewrite to 156MB) and blew
+    // the /tmp budget at frame ~17000. Fragmented MP4 emits a small moov
+    // up front followed by self-contained `moof+mdat` fragments — no
+    // rewrite needed, and Cloudflare Stream ingests fMP4 cleanly.
     "-movflags",
-    "+faststart",
+    "+empty_moov+default_base_moof+frag_keyframe",
     "-f",
     "mp4",
     "-y",
