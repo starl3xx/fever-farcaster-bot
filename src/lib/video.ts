@@ -50,12 +50,18 @@ async function encodeToFile(
     "scale=-2:720",
     "-c:v",
     "libx264",
+    // `veryfast` instead of `ultrafast`: ultrafast skips CABAC, B-frames,
+    // and deblocking, producing non-standard H.264 that Cloudflare's HLS
+    // transcoder rejected (persistent 424 on the manifest, even with the
+    // profile/level hints below). `veryfast` is ~2× slower but produces
+    // a fully-conformant stream — ~100s for 10 min of 720p, fits the
+    // 600s function budget with room for the upload+poll steps.
     "-preset",
-    "ultrafast",
+    "veryfast",
     // Force Cloudflare-friendly H.264: Main profile, Level 4.0, yuv420p
-    // pixel format. ultrafast defaults to High444 / yuv444p which a lot of
-    // downstream transcoders (including Cloudflare's HLS pipeline) can't
-    // ingest, producing 424s on the resulting manifest.
+    // pixel format. Standard cross-transcoder defaults — without these
+    // libx264 will sometimes emit High profile / yuv444p depending on the
+    // input, which some downstream pipelines refuse to ingest.
     "-profile:v",
     "main",
     "-level",
