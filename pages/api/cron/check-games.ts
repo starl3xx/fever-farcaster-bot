@@ -7,7 +7,7 @@ import {
 import type { BoxscorePlayer } from "../../../src/lib/formatter";
 import { findRecapVideoId } from "../../../src/lib/youtube";
 import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
-import { uploadToFarcasterStream, remuxToMp4Buffer } from "../../../src/lib/video";
+import { uploadRemuxedToFarcasterStream } from "../../../src/lib/video";
 import { formatRecapCast } from "../../../src/lib/formatter";
 import { postToChannel } from "../../../src/lib/neynar";
 import {
@@ -172,19 +172,16 @@ async function processGame(gameId: string): Promise<string> {
     videoFailureReason = `yt-dlp download failed for ${videoId}`;
   } else {
     try {
-      // The raw HLS download is MPEG-TS-in-MP4 (yt-dlp --fixup never), which
-      // uploads to Cloudflare Stream successfully but the resulting transcode
-      // is broken (m3u8 doesn't play). Remux into a proper fragmented MP4 in
-      // memory before upload; can't use a /tmp file because the 330MB source
-      // plus a same-size output would exceed Vercel's 512MB /tmp budget.
-      const remuxed = await remuxToMp4Buffer(download.filePath);
-      if (!remuxed) {
-        videoFailureReason = "ffmpeg remux to mp4 failed";
-      } else {
-        playbackUrl = await uploadToFarcasterStream(remuxed, gameId);
-        if (!playbackUrl) {
-          videoFailureReason = "farcaster stream upload failed";
-        }
+      // Stream ffmpeg's transcode output directly into the TUS upload.
+      // Buffering the full re-encoded 1080p file in memory hits Vercel's
+      // 2GB function ceiling; spooling it to /tmp doesn't fit either
+      // (512MB cap, with the 330MB source already occupying most of it).
+      playbackUrl = await uploadRemuxedToFarcasterStream(
+        download.filePath,
+        gameId
+      );
+      if (!playbackUrl) {
+        videoFailureReason = "farcaster stream upload failed";
       }
     } finally {
       const { unlink } = await import("fs/promises");
