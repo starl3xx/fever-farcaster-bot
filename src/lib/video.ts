@@ -39,6 +39,11 @@ async function encodeToFile(
 ): Promise<boolean> {
   const ffmpegBin = resolveFfmpegBin();
   const args = [
+    // yt-dlp's MPEG-TS-in-MP4 has ragged timestamps; regenerate PTS and
+    // ignore source DTS so the encoded output has clean monotonic timing
+    // (Cloudflare's transcoder errored on the un-fixed timing).
+    "-fflags",
+    "+genpts+igndts",
     "-i",
     sourcePath,
     "-vf",
@@ -47,6 +52,21 @@ async function encodeToFile(
     "libx264",
     "-preset",
     "ultrafast",
+    // Force Cloudflare-friendly H.264: Main profile, Level 4.0, yuv420p
+    // pixel format. ultrafast defaults to High444 / yuv444p which a lot of
+    // downstream transcoders (including Cloudflare's HLS pipeline) can't
+    // ingest, producing 424s on the resulting manifest.
+    "-profile:v",
+    "main",
+    "-level",
+    "4.0",
+    "-pix_fmt",
+    "yuv420p",
+    // Force a 2-second keyframe interval (30 fps × 2 = 60). HLS segments
+    // need regular keyframes to split cleanly; without this, ultrafast
+    // emits sparse keyframes and the segmenter struggles.
+    "-g",
+    "60",
     "-b:v",
     "1M",
     "-maxrate",
@@ -57,12 +77,13 @@ async function encodeToFile(
     "aac",
     "-b:a",
     "128k",
-    // Plain MP4: moov atom ends up at the end of the file (no `+faststart`
-    // rewrite, which would double peak /tmp use). Cloudflare's transcoder
-    // ingests the file from its own backend storage (uploaded via TUS) so
-    // it can seek for moov without needing it at the front. Fragmented MP4
-    // (`+empty_moov+default_base_moof+frag_keyframe`) made Cloudflare 500
-    // then 404 the transcoded manifest, so we're back to the plain variant.
+    "-ar",
+    "44100",
+    "-ac",
+    "2",
+    // Plain MP4 (moov at end). Cloudflare ingests from their backend
+    // storage and can seek for moov, so faststart isn't needed and would
+    // double peak /tmp use during the post-encode rewrite.
     "-f",
     "mp4",
     "-y",
