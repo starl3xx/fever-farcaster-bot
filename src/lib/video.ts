@@ -27,6 +27,11 @@ function resolveFfmpegBin(): string {
  */
 function spawnRemuxProc(filePath: string): FfmpegProc {
   const ffmpegBin = resolveFfmpegBin();
+  // Bitrate-capped encode rather than CRF: Farcaster's prepare-video-upload
+  // rejects videos over 1GB ("Video needs to be under 1GB"), and ultrafast
+  // crf 23 at 1080p routinely overshoots that. -b:v 4M with -maxrate 5M
+  // produces ~300-400MB for a 10-min recap (4 Mbps × 600s = 300MB), close
+  // to the source quality and comfortably under the 1GB ceiling.
   const args = [
     "-i",
     filePath,
@@ -34,8 +39,12 @@ function spawnRemuxProc(filePath: string): FfmpegProc {
     "libx264",
     "-preset",
     "ultrafast",
-    "-crf",
-    "23",
+    "-b:v",
+    "4M",
+    "-maxrate",
+    "5M",
+    "-bufsize",
+    "8M",
     "-c:a",
     "aac",
     "-b:a",
@@ -76,10 +85,10 @@ export async function uploadRemuxedToFarcasterStream(
     const sourceMB = (sourceStat.size / 1024 / 1024).toFixed(1);
     console.log(`[video] Source ${sourceFilePath} (${sourceMB}MB)`);
 
-    // Generous upper bound for prepare-video-upload. ultrafast crf 23
-    // typically produces 4-6× the source size for HLS-sourced 1080p, so
-    // 6× covers worst case without being absurd.
-    const estimatedSize = sourceStat.size * 6;
+    // Upper bound for prepare-video-upload. Farcaster rejects >1GB, and our
+    // bitrate-capped encode produces ~300-500MB for a 10-min recap. Send
+    // 900MB so we're safely under the limit while leaving room for variance.
+    const estimatedSize = 900_000_000;
 
     console.log("[video] Preparing Farcaster video upload...");
     const prepareRes = await fcFetch("/v1/prepare-video-upload", {
