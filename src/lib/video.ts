@@ -190,12 +190,21 @@ export async function uploadRemuxedToFarcasterStream(
 
     const embedUrl = await pollForReady(videoId);
 
-    if (embedUrl) {
-      console.log("[video] Waiting for embed classifier to index...");
-      const verified = await waitForEmbedReady(embedUrl);
-      if (!verified) {
-        console.warn("[video] Embed URL never became fetchable — posting anyway");
-      }
+    if (!embedUrl) {
+      return null;
+    }
+
+    console.log("[video] Waiting for embed classifier to index...");
+    const verified = await waitForEmbedReady(embedUrl);
+    if (!verified) {
+      // Don't hand back an unverified URL — Farcaster's /v2/casts will
+      // accept the post but render it without a video embed. Returning
+      // null kicks the caller's retry counter; after MAX_RECAP_RETRIES
+      // it falls back to a YouTube-URL embed.
+      console.error(
+        "[video] Embed classifier never confirmed — treating as failure"
+      );
+      return null;
     }
 
     return embedUrl;

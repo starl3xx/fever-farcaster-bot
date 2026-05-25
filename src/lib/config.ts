@@ -19,12 +19,17 @@ export const YOUTUBE_OFFICIAL_CHANNELS = {
 export const REDIS_KEYS = {
   GAME_POSTED: "fever:game:", // fever:game:{gameId} → cast hash
   GAME_TRACKING: "fever:track:", // fever:track:{gameId} → retry count
+  GAME_LOCK: "fever:lock:", // fever:lock:{gameId} → serialization lock
   PENDING_GAMES: "fever:pending", // Set of gameIds being retried across days
 } as const;
 
 export const REDIS_TTL = {
   GAME_POSTED: 60 * 60 * 24 * 30, // 30 days
   GAME_TRACKING: 60 * 60 * 6, // 6 hours — must outlive MAX_RECAP_RETRIES
+  // Lock TTL must exceed function maxDuration (600s) so a crashed invocation
+  // can't leave the lock held indefinitely, but is short enough that real
+  // failures recover within a couple cron intervals.
+  GAME_LOCK: 700,
 } as const;
 
 // Recap retry: 24 retries × 5 min interval = 2 hours max wait. The WNBA's

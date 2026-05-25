@@ -18,6 +18,8 @@ import {
   addPendingGame,
   removePendingGame,
   listPendingGames,
+  acquireGameLock,
+  releaseGameLock,
 } from "../../../src/lib/store";
 import { FEVER_TEAM_TRICODE, MAX_RECAP_RETRIES } from "../../../src/lib/config";
 
@@ -120,6 +122,34 @@ async function processGame(gameId: string): Promise<string> {
     return "already posted";
   }
 
+  // Serialize per-game work. Cron fires every 5 min; the video pipeline
+  // (encode + TUS upload + ready-poll + classifier wait) routinely takes
+  // 6-10 min. Without this lock, concurrent invocations each ran the full
+  // pipeline and each published a cast.
+  const locked = await acquireGameLock(gameId);
+  if (!locked) {
+    return "skipped: another invocation holds the lock";
+  }
+
+  let result: string;
+  try {
+    result = await processGameLocked(gameId);
+  } catch (err) {
+    // Release on unexpected error so the next cron can retry promptly
+    // instead of waiting out the full lock TTL.
+    await releaseGameLock(gameId);
+    throw err;
+  }
+  // Only release on a successful post. For non-success outcomes (waiting,
+  // retry, failure) the TTL absorbs the wait so we don't hammer the same
+  // game in a tight loop.
+  if (result.startsWith("posted")) {
+    await releaseGameLock(gameId);
+  }
+  return result;
+}
+
+async function processGameLocked(gameId: string): Promise<string> {
   // Fetch box score for scores + full team names.
   const box = await fetchBoxscore(gameId);
   if (!box) {

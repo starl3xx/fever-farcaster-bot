@@ -54,6 +54,23 @@ export async function incrementGameTracking(gameId: string): Promise<number> {
   return count;
 }
 
+// Per-game lock to serialize cron invocations. The 5-min cron interval is
+// shorter than the 6-10 min video pipeline, so without locking, invocation
+// N+1 starts before N has marked the game posted and both publish casts.
+// Returns true if this caller now holds the lock.
+export async function acquireGameLock(gameId: string): Promise<boolean> {
+  const result = await getRedis().set(
+    `${REDIS_KEYS.GAME_LOCK}${gameId}`,
+    "1",
+    { nx: true, ex: REDIS_TTL.GAME_LOCK }
+  );
+  return result === "OK";
+}
+
+export async function releaseGameLock(gameId: string): Promise<void> {
+  await getRedis().del(`${REDIS_KEYS.GAME_LOCK}${gameId}`);
+}
+
 // Pending-games set — gameIds still being retried across day boundaries.
 // Today's scoreboard only includes today's games, so without this set a
 // game that rolls off the scoreboard before the recap downloads would
