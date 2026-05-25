@@ -57,8 +57,15 @@ async function encodeToFile(
     "aac",
     "-b:a",
     "128k",
+    // MP4 with faststart: moov atom rewritten to the front of the file so
+    // Cloudflare Stream's transcoder can start reading without seeking
+    // through the whole file. We tried MKV first (a streaming-friendly
+    // container) but Cloudflare's transcoder returned 424 on the resulting
+    // manifest — the same code path produces valid HLS from MP4 inputs.
+    "-movflags",
+    "+faststart",
     "-f",
-    "matroska",
+    "mp4",
     "-y",
     outPath,
   ];
@@ -107,7 +114,7 @@ export async function uploadRemuxedToFarcasterStream(
 ): Promise<string | null> {
   const encodedPath = path.join(
     os.tmpdir(),
-    `encoded-${Date.now()}.mkv`
+    `encoded-${Date.now()}.mp4`
   );
 
   try {
@@ -199,7 +206,7 @@ async function tusUploadFile(
     headers: {
       "Tus-Resumable": "1.0.0",
       "Upload-Length": String(sizeBytes),
-      "Upload-Metadata": `filename ${btoa("video.mkv")},filetype ${btoa("video/x-matroska")}`,
+      "Upload-Metadata": `filename ${btoa("video.mp4")},filetype ${btoa("video/mp4")}`,
     },
   });
 

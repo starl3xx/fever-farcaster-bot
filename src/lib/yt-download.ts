@@ -170,7 +170,8 @@ export async function downloadYouTubeMp4(
       const full = path.join(tmpDir, name);
       if (
         (name.startsWith("recap-") && name.endsWith(".mp4")) ||
-        (name.startsWith("encoded-") && name.endsWith(".mkv"))
+        (name.startsWith("encoded-") &&
+          (name.endsWith(".mp4") || name.endsWith(".mkv")))
       ) {
         await fs.unlink(full).catch(() => {});
       } else if (name.startsWith("_MEI")) {
