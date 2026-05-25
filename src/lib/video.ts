@@ -348,8 +348,20 @@ async function pollForReady(videoId: string): Promise<string | null> {
       const data = await res.json();
       const video = data.result?.video;
       const embed = video?.embed;
+      const state = video?.state || data.result?.state;
 
-      if (embed?.url || embed?.sourceUrl) {
+      if (state === "error" || state === "failed") {
+        console.error("[video] Processing failed:", JSON.stringify(data.result));
+        return null;
+      }
+
+      // Only treat the video as ready when state is explicitly "ready" AND
+      // an embed URL exists. Earlier we returned as soon as embed.url was
+      // populated, but Farcaster sets that field before Cloudflare's
+      // transcode completes — we'd hand back a URL that the CDN 424s on.
+      // The transcode-complete signal is `state === "ready"` AND embed
+      // dimensions being known.
+      if (state === "ready" && (embed?.url || embed?.sourceUrl)) {
         const embedUrl = embed.url || embed.sourceUrl;
         console.log(`[video] Video ready! Embed URL: ${embedUrl}`);
         if (embed.sourceUrl && embed.url && embed.sourceUrl !== embed.url) {
@@ -359,14 +371,12 @@ async function pollForReady(videoId: string): Promise<string | null> {
         return embedUrl;
       }
 
-      const state = video?.state || data.result?.state;
-
-      if (state === "error" || state === "failed") {
-        console.error("[video] Processing failed:", JSON.stringify(data.result));
-        return null;
-      }
-
-      console.log(`[video] Processing... (${state || "unknown"}, attempt ${i + 1}/${maxAttempts})`);
+      // Dump the full result block once per attempt so we can see exactly
+      // what Farcaster reports during processing — the prior failures
+      // surfaced no state info beyond "embed.url present, but unplayable".
+      console.log(
+        `[video] Processing... (state=${state || "unknown"}, attempt ${i + 1}/${maxAttempts}): ${JSON.stringify(data.result).slice(0, 500)}`
+      );
     } catch (err) {
       console.error(`[video] Poll error:`, err);
     }
