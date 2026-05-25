@@ -123,14 +123,104 @@ async function encodeToFile(
 }
 
 /**
- * Upload the recap to Farcaster's video infrastructure. Returns the
- * playback URL that renders as native video in Farcaster clients, or null
- * on any pipeline failure.
+ * Download a clean mp4 from a public URL into /tmp, upload it to
+ * Farcaster's stream service, and return the native playback URL.
+ *
+ * Used for the WNBA team-site recap mp4, which is already H.264/AAC in a
+ * clean MP4 container — no encode step needed. Mirrors the Cubs bot's
+ * working approach (which uses MLB's playback URLs directly).
+ *
+ * Returns null on any failure; the caller's retry counter handles transient
+ * issues, and the final fallback is posting the cast without a native embed.
+ */
+export async function uploadMp4UrlToFarcasterStream(
+  mp4Url: string,
+  _slug: string
+): Promise<string | null> {
+  const tmpPath = path.join(os.tmpdir(), `recap-${Date.now()}.mp4`);
+
+  try {
+    console.log(`[video] Downloading mp4: ${mp4Url}`);
+    const dlRes = await fetch(mp4Url);
+    if (!dlRes.ok || !dlRes.body) {
+      console.error(`[video] Failed to fetch mp4: ${dlRes.status}`);
+      return null;
+    }
+
+    const { writeFile } = await import("fs/promises");
+    const buf = Buffer.from(await dlRes.arrayBuffer());
+    await writeFile(tmpPath, buf);
+    const sizeMB = (buf.length / 1024 / 1024).toFixed(1);
+    console.log(`[video] Downloaded ${sizeMB}MB to ${tmpPath}`);
+
+    console.log("[video] Preparing Farcaster video upload...");
+    const prepareRes = await fcFetch("/v1/prepare-video-upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        videoSizeBytes: buf.length,
+        supportsDynamicUpload: true,
+      }),
+    });
+
+    if (!prepareRes.ok) {
+      console.error(
+        `[video] prepare-video-upload failed: ${prepareRes.status} ${await prepareRes.text()}`
+      );
+      return null;
+    }
+
+    const prepareData = await prepareRes.json();
+    const result = prepareData.result;
+    const videoId: string | undefined = result?.videoId;
+    const uploadUrl: string | undefined = result?.uploadUrl;
+
+    if (!videoId || !uploadUrl) {
+      console.error("[video] Missing videoId/uploadUrl:", JSON.stringify(prepareData));
+      return null;
+    }
+
+    console.log(`[video] Video prepared: ${videoId}`);
+
+    const uploaded = await tusUploadFile(uploadUrl, tmpPath, buf.length);
+    if (!uploaded) {
+      console.error("[video] TUS upload failed");
+      return null;
+    }
+
+    console.log("[video] Upload complete, waiting for processing...");
+
+    const embedUrl = await pollForReady(videoId);
+    if (!embedUrl) {
+      return null;
+    }
+
+    console.log("[video] Waiting for embed classifier to index...");
+    const verified = await waitForEmbedReady(embedUrl);
+    if (!verified) {
+      console.error(
+        "[video] Embed classifier never confirmed — treating as failure"
+      );
+      return null;
+    }
+
+    return embedUrl;
+  } catch (err) {
+    console.error("[video] Farcaster video upload failed:", err);
+    return null;
+  } finally {
+    await unlink(tmpPath).catch(() => {});
+  }
+}
+
+/**
+ * @deprecated Use uploadMp4UrlToFarcasterStream — kept temporarily for the
+ * yt-dlp/ffmpeg path in case the WNBA team-site URL ever moves.
  *
  * Flow:
- *   1. ffmpeg-encode source → /tmp/encoded-*.mkv (bitrate-capped, fits /tmp)
+ *   1. ffmpeg-encode source → /tmp/encoded-*.mp4 (bitrate-capped, fits /tmp)
  *   2. prepare-video-upload (Farcaster) — get videoId + TUS endpoint
- *   3. TUS upload from /tmp/encoded-*.mkv in 20 MB chunks
+ *   3. TUS upload from /tmp/encoded-*.mp4 in 20 MB chunks
  *   4. Poll until Farcaster's pipeline produces an embed URL
  *   5. Wait briefly for the embed classifier to index it
  */

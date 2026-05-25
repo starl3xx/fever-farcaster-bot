@@ -169,6 +169,58 @@ export async function getRecapMetadata(
   };
 }
 
+/**
+ * Construct and verify the Fever team-site mp4 URL for a recap on this date.
+ *
+ * The WNBA's WordPress media CDN publishes a clean 720p H.264/AAC mp4 for
+ * every Fever game at a deterministic path, served unauthenticated via
+ * CloudFront. This is the equivalent of MLB's playback URLs for the Cubs
+ * bot — no transcoding needed, just download and upload.
+ *
+ * Pattern (verified across 2025 and 2026 Fever home + away games):
+ *   videos.nba.com/wordpress/uploads/media/sites/fever/{YYYY}/{MM}/
+ *     highlights-{YYMMDD}_1280x720.mp4
+ *
+ * The date is the game's local Eastern Time date (matches what the digital
+ * team enters on the WP site, regardless of where the game was played).
+ *
+ * The digital team uploads ~1-2 hours after final, so this returns null
+ * during that window. Callers should retry via MAX_RECAP_RETRIES.
+ */
+export async function findWnbaRecapMp4Url(
+  gameDateISO: string
+): Promise<string | null> {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(gameDateISO));
+
+  const yyyy = parts.find((p) => p.type === "year")!.value;
+  const mm = parts.find((p) => p.type === "month")!.value;
+  const dd = parts.find((p) => p.type === "day")!.value;
+  const yy = yyyy.slice(-2);
+
+  const url = `https://videos.nba.com/wordpress/uploads/media/sites/fever/${yyyy}/${mm}/highlights-${yy}${mm}${dd}_1280x720.mp4`;
+
+  try {
+    const res = await fetch(url, {
+      method: "HEAD",
+      headers: { "User-Agent": BROWSER_UA },
+    });
+    if (res.ok) {
+      console.log(`[wnba-recap] mp4 ready (${res.headers.get("content-length")} bytes): ${url}`);
+      return url;
+    }
+    console.log(`[wnba-recap] mp4 not yet posted: ${res.status} (${url})`);
+    return null;
+  } catch (err) {
+    console.error(`[wnba-recap] HEAD failed for ${url}:`, err);
+    return null;
+  }
+}
+
 export interface FeverStandings {
   record: string;          // e.g. "4-2"
   winPct: number;          // e.g. 0.667

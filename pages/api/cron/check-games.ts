@@ -3,11 +3,10 @@ import {
   getTodaysFeverGames,
   getRecapMetadata,
   getFeverStandings,
+  findWnbaRecapMp4Url,
 } from "../../../src/lib/wnba";
 import type { BoxscorePlayer } from "../../../src/lib/formatter";
-import { findRecapVideoId } from "../../../src/lib/youtube";
-import { downloadYouTubeMp4 } from "../../../src/lib/yt-download";
-import { uploadRemuxedToFarcasterStream } from "../../../src/lib/video";
+import { uploadMp4UrlToFarcasterStream } from "../../../src/lib/video";
 import { formatRecapCast } from "../../../src/lib/formatter";
 import { postToChannel } from "../../../src/lib/neynar";
 import {
@@ -172,50 +171,19 @@ async function processGameLocked(gameId: string): Promise<string> {
   // metadata's gameDateISO if the boxscore didn't supply one.
   const gameDateISO = box.gameTimeUTC || recapMeta.gameDateISO;
 
-  // Look up the corresponding YouTube video.
-  const videoId = await findRecapVideoId({
-    recapTitle: recapMeta.title,
-    gameDateISO,
-    homeTricode: box.home.teamTricode,
-    awayTricode: box.away.teamTricode,
-    homeName: fullTeamName(box.home),
-    awayName: fullTeamName(box.away),
-  });
-  if (!videoId) {
-    const count = await getGameTracking(gameId);
-    if (count < MAX_RECAP_RETRIES) {
-      await incrementGameTracking(gameId);
-      return `waiting for YouTube recap (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
-    }
-    await removePendingGame(gameId);
-    return `gave up: no YouTube recap match after ${MAX_RECAP_RETRIES} retries`;
-  }
-
-  // Try to produce a native video embed. On any failure, retry up to MAX
-  // attempts (shared counter), then fall back to posting a YouTube-URL embed
-  // so users still get a cast (with the YT card unfurling natively).
+  // Source the clean 720p mp4 directly from the WNBA team-site CDN. The
+  // recap is uploaded ~1-2 hours after final, so the first few retries may
+  // 404 while we wait for the digital staff to publish it.
   let playbackUrl: string | null = null;
   let videoFailureReason: string | null = null;
 
-  const download = await downloadYouTubeMp4(videoId);
-  if (!download) {
-    videoFailureReason = `yt-dlp download failed for ${videoId}`;
+  const mp4Url = await findWnbaRecapMp4Url(gameDateISO);
+  if (!mp4Url) {
+    videoFailureReason = "WNBA recap mp4 not yet posted";
   } else {
-    try {
-      // Stream ffmpeg's transcode output directly into the TUS upload.
-      // Buffering the full re-encoded 1080p file in memory hits Vercel's
-      // 2GB function ceiling; spooling it to /tmp doesn't fit either
-      // (512MB cap, with the 330MB source already occupying most of it).
-      playbackUrl = await uploadRemuxedToFarcasterStream(
-        download.filePath,
-        gameId
-      );
-      if (!playbackUrl) {
-        videoFailureReason = "farcaster stream upload failed";
-      }
-    } finally {
-      const { unlink } = await import("fs/promises");
-      await unlink(download.filePath).catch(() => {});
+    playbackUrl = await uploadMp4UrlToFarcasterStream(mp4Url, gameId);
+    if (!playbackUrl) {
+      videoFailureReason = "farcaster stream upload failed";
     }
   }
 
@@ -226,7 +194,7 @@ async function processGameLocked(gameId: string): Promise<string> {
       return `${videoFailureReason} (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
     }
     console.warn(
-      `[check-games] ${videoFailureReason} after ${MAX_RECAP_RETRIES} retries — falling back to YouTube embed`
+      `[check-games] ${videoFailureReason} after ${MAX_RECAP_RETRIES} retries — falling back to permalink embed`
     );
     // Fall through to the post step with playbackUrl still null.
   }
@@ -253,7 +221,7 @@ async function processGameLocked(gameId: string): Promise<string> {
   });
 
   const usingVideo = playbackUrl !== null;
-  const embedUrl = playbackUrl ?? `https://youtube.com/watch?v=${videoId}`;
+  const embedUrl = playbackUrl ?? recapMeta.permalink;
 
   const result = await postToChannel(text, {
     embeds: [{ url: embedUrl }],
@@ -266,7 +234,7 @@ async function processGameLocked(gameId: string): Promise<string> {
     await removePendingGame(gameId);
     return usingVideo
       ? `posted (video): ${result.hash}`
-      : `posted (yt-fallback): ${result.hash}`;
+      : `posted (permalink-fallback): ${result.hash}`;
   }
   return `post failed: ${result.error}`;
 }
