@@ -197,7 +197,13 @@ export async function downloadYouTubeMp4(
     // HLS we want without going off-script: 96=1080p, 95=720p, 94=480p,
     // 93=360p HLS, 18=360p direct https. Set YT_DLP_MAX_HEIGHT=1080 to
     // retest 1080p if proxy quality ever improves.
-    const maxHeight = process.env.YT_DLP_MAX_HEIGHT || "720";
+    // Hard-cap at 720p regardless of YT_DLP_MAX_HEIGHT env. The full
+    // pipeline (download → fixup → re-encode → upload) only fits Vercel's
+    // 512MB /tmp at 720p source size: 1080p source is ~330MB which leaves
+    // no room for the yt-dlp fixup remux temp file (~330MB) OR the ffmpeg
+    // encode output. The env override is honored only when the next two
+    // budget assumptions can change (e.g., streaming yt-dlp → ffmpeg pipe).
+    const maxHeight = "720";
     // Format ladder by resolution descending, English-language preferred,
     // then any-language. Cap at maxHeight by trimming the front of the list.
     const ladder = [
@@ -233,13 +239,14 @@ export async function downloadYouTubeMp4(
       // request, so the actual exit/error info gets dropped. We keep
       // [info]/[error] lines which carry the diagnostics we care about.
       "--no-progress",
-      // Skip yt-dlp's FixupM3u8 step. The default fixup writes a remuxed
-      // temp file alongside the original (in-place "fix"), which doubles
-      // /tmp usage and breaks on 1080p (337 MB × 2 > Vercel's 512 MB /tmp).
-      // The output is still MPEG-TS-in-MP4, which Cloudflare Stream
-      // (Farcaster Stream's backend) ingests fine and re-encodes itself.
-      "--fixup",
-      "never",
+      // Let yt-dlp run its FixupM3u8 step (default behavior). The fixup
+      // applies the `aac_adtstoasc` bitstream filter and produces a clean,
+      // standards-conformant MP4 — not the MPEG-TS-in-MP4 hybrid we got
+      // from `--fixup never`. Cloudflare's HLS transcoder rejected every
+      // variant we tried to produce from the MPEG-TS-in-MP4 source (424
+      // on the resulting manifest, regardless of preset/profile/container).
+      // The fixup needs a 100MB temp file alongside the 100MB 720p source;
+      // fine at 720p, untenable at 1080p (hence the hard 720p cap above).
       ...(verbose ? ["-v"] : ["--no-warnings"]),
       ...(qjsBin ? ["--js-runtimes", `quickjs:${qjsBin}`] : []),
       ...(ffmpegLocation ? ["--ffmpeg-location", ffmpegLocation] : []),
