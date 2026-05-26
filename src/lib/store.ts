@@ -54,6 +54,25 @@ export async function incrementGameTracking(gameId: string): Promise<number> {
   return count;
 }
 
+// News dedup — keyed on ESPN's stable numeric article id.
+export async function isNewsPosted(articleId: number): Promise<boolean> {
+  const result = await getRedis().get(
+    `${REDIS_KEYS.NEWS_POSTED}${articleId}`
+  );
+  return result !== null;
+}
+
+export async function markNewsPosted(
+  articleId: number,
+  castHash: string
+): Promise<void> {
+  await getRedis().set(
+    `${REDIS_KEYS.NEWS_POSTED}${articleId}`,
+    castHash,
+    { ex: REDIS_TTL.NEWS_POSTED }
+  );
+}
+
 // Per-game lock to serialize cron invocations. The 5-min cron interval is
 // shorter than the 6-10 min video pipeline, so without locking, invocation
 // N+1 starts before N has marked the game posted and both publish casts.

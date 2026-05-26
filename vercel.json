@@ -1,6 +1,7 @@
 {
   "crons": [
-    { "path": "/api/cron/check-games", "schedule": "*/5 * * * *" }
+    { "path": "/api/cron/check-games", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/check-news",  "schedule": "0 */2 * * *" }
   ],
   "functions": {
     "pages/api/cron/check-games.ts": {

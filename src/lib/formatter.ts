@@ -117,3 +117,21 @@ export function formatRecapCast(args: FormatRecapCastArgs): string {
   if (text.length <= CAST_CHAR_LIMIT) return text;
   return text.slice(0, CAST_CHAR_LIMIT - 1) + "…";
 }
+
+/**
+ * Format a Fever news cast from an ESPN article. The article URL itself
+ * is passed as the embed (Farcaster unfurls ESPN URLs into a card with
+ * the headline image), so the body keeps the headline + an attribution
+ * line and lets the embed carry the visual weight.
+ */
+export function formatNewsCast(
+  headline: string,
+  byline: string | undefined,
+  url: string
+): string {
+  const trail = byline ? `✍️ ${byline} | Read more \u{1F447}` : `Read more \u{1F447}`;
+  const text = `\u{1F4E3} Fever news: ${headline}\n\n${trail}`;
+  if (text.length <= CAST_CHAR_LIMIT) return text;
+  const room = CAST_CHAR_LIMIT - (trail.length + "📣 Fever news: \n\n".length + 1);
+  return `\u{1F4E3} Fever news: ${headline.slice(0, room)}…\n\n${trail}`;
+}

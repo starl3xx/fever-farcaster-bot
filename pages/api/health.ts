@@ -13,6 +13,7 @@ export default async function handler(
     redis,
     env: {
       botEnabled: process.env.BOT_ENABLED === "true",
+      newsEnabled: process.env.NEWS_ENABLED === "true",
       hasNeynarKey: !!process.env.NEYNAR_API_KEY,
       hasSignerUuid: !!process.env.NEYNAR_SIGNER_UUID,
       hasCustodyMnemonic: !!process.env.FC_CUSTODY_MNEMONIC,
