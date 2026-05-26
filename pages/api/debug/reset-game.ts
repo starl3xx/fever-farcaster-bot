@@ -32,13 +32,16 @@ export default async function handler(
 
   const postedKey = `${REDIS_KEYS.GAME_POSTED}${gameId}`;
   const trackingKey = `${REDIS_KEYS.GAME_TRACKING}${gameId}`;
+  const lockKey = `${REDIS_KEYS.GAME_LOCK}${gameId}`;
   // SADD pending so the cron picks the game up next tick, even after
   // the WNBA scoreboard has rolled over and no longer lists it as today's.
-  const [postedDeleted, trackingDeleted, pendingAdded] = await Promise.all([
-    redis.del(postedKey),
-    redis.del(trackingKey),
-    redis.sadd(REDIS_KEYS.PENDING_GAMES, gameId),
-  ]);
+  const [postedDeleted, trackingDeleted, lockDeleted, pendingAdded] =
+    await Promise.all([
+      redis.del(postedKey),
+      redis.del(trackingKey),
+      redis.del(lockKey),
+      redis.sadd(REDIS_KEYS.PENDING_GAMES, gameId),
+    ]);
 
   return res.status(200).json({
     ok: true,
@@ -46,6 +49,7 @@ export default async function handler(
     cleared: {
       [postedKey]: postedDeleted,
       [trackingKey]: trackingDeleted,
+      [lockKey]: lockDeleted,
     },
     pending_added: pendingAdded,
   });
