@@ -1,6 +1,6 @@
 # fever-farcaster-bot
 
-Posts Indiana Fever WNBA game recaps to the [`/fever`](https://farcaster.xyz/~/channel/fever) Farcaster channel — native inline video, top performers, and live standings.
+Posts Indiana Fever WNBA game recaps and news to the [`/fever`](https://farcaster.xyz/~/channel/fever) Farcaster channel — native inline video on recaps, ESPN-sourced article cards on news.
 
 A fork-in-spirit of [`cubs-farcaster-bot`](https://github.com/starl3xx/cubs-farcaster-bot).
 
@@ -57,7 +57,8 @@ The video source — `https://videos.nba.com/wordpress/uploads/media/sites/fever
    - `FC_CUSTODY_MNEMONIC` — wallet mnemonic for the bot's Farcaster custody address (used to mint Farcaster session tokens for video casts).
    - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN` — Upstash Redis (or rename to `KV_REST_API_*` if using Vercel KV).
    - `CRON_SECRET` — any random string; Vercel sends it as a Bearer token to cron endpoints.
-   - `BOT_ENABLED` — set to `true` to actually post (false = dry-run; logs the cast but skips Neynar / Farcaster API).
+   - `BOT_ENABLED` — set to `true` to actually post recaps (false = dry-run; logs the cast but skips Neynar / Farcaster API).
+   - `NEWS_ENABLED` — set to `true` to enable the news cron. Independent of `BOT_ENABLED` so the two pipelines can be ramped separately.
 
 2. Install deps:
    ```bash
@@ -91,9 +92,9 @@ Cast format:
 
 Farcaster unfurls the ESPN URL into a card with the article's hero image — no extra embed work needed.
 
-## Cron behavior
+## Recap cron behavior
 
-- **Schedule**: every 5 minutes (`*/5 * * * *`).
+- **Schedule**: every 5 minutes (`*/5 * * * *`), endpoint `/api/cron/check-games`. Gated by `BOT_ENABLED=true`.
 - **Per-game lock**: `processGame` acquires a Redis lock (`fever:lock:{gameId}`, `SET NX EX 700`) before any work. Cron concurrency previously caused duplicate casts when the pipeline outran the 5-minute interval; the lock serializes per-game work. Released on a successful post; on failure it rides out the TTL so retries don't tight-loop.
 - **Retry window**: 24 attempts × 5 min = **2 hours** per game (`MAX_RECAP_RETRIES` in `src/lib/config.ts`). This matches the typical WNBA team-site upload lag with margin. After exhausting retries, the bot posts with the WNBA watch-page URL as a non-video embed so users still get a cast.
 - **Cross-day persistence**: today's WNBA scoreboard only lists today's games. Once a game first appears as `Final`, its `gameId` is added to a Redis pending-games set (`fever:pending`) and stays there until the cast posts or retries exhaust. This keeps games alive through next-day scoreboard rollover.
