@@ -34,6 +34,9 @@ async function getChannelParentUrl(): Promise<string> {
 
 export interface PostResult {
   hash: string;
+  /** Author fid of the published cast, when the API returns it. Stored so a
+   *  later native-video cast can reply to this one (reply parent = {fid, hash}). */
+  fid?: number;
   error?: undefined;
 }
 
@@ -47,6 +50,9 @@ interface PostOptions {
   idem?: string;
   /** If true, post via Farcaster's API for native video embed support */
   hasVideo?: boolean;
+  /** Post as a reply to this cast (used to upgrade an image fallback to video).
+   *  Only honored on the Farcaster-API (hasVideo) path. */
+  parent?: { fid: number; hash: string };
 }
 
 /**
@@ -84,7 +90,10 @@ export async function postToChannel(
     });
 
     console.log("[neynar] Cast published:", response.cast.hash);
-    return { hash: response.cast.hash };
+    return {
+      hash: response.cast.hash,
+      fid: (response.cast as { author?: { fid?: number } }).author?.fid,
+    };
   } catch (err: any) {
     const message = err?.response?.data
       ? JSON.stringify(err.response.data)
@@ -111,10 +120,20 @@ async function postViaFarcasterApi(
     const body: Record<string, unknown> = {
       text,
       embeds: embedUrls,
-      channelKey: CHANNEL_ID, // Farcaster API requires exact channel slug
     };
+    if (options.parent) {
+      // Reply: the parent identifies the thread; the channel is inherited from
+      // it, so we must NOT also send channelKey (the API rejects both together).
+      body.parent = options.parent;
+    } else {
+      body.channelKey = CHANNEL_ID; // Farcaster API requires exact channel slug
+    }
 
-    console.log("[fc-api] Posting cast via Farcaster API with video embed...");
+    console.log(
+      options.parent
+        ? "[fc-api] Posting video reply (fallback → native-video upgrade)..."
+        : "[fc-api] Posting cast via Farcaster API with video embed..."
+    );
     const res = await fcFetch("/v2/casts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -132,7 +151,7 @@ async function postViaFarcasterApi(
 
     if (hash) {
       console.log("[fc-api] Cast published:", hash);
-      return { hash };
+      return { hash, fid: data.result?.cast?.author?.fid };
     }
 
     console.error("[fc-api] No hash in response:", JSON.stringify(data));

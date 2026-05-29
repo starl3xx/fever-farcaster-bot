@@ -31,6 +31,12 @@ interface FormatRecapCastArgs {
   feverPlayers: BoxscorePlayer[];
   /** Fever team standings; null if standings fetch failed. */
   standings: FeverStandings | null;
+  /**
+   * Recap watch-page URL. Only passed on the non-video image fallback, where it
+   * is appended as a clickable line so users can still reach the video on
+   * wnba.com. Omitted for native-video casts (the video itself is the embed).
+   */
+  recapWatchUrl?: string;
 }
 
 function n(v: number | string): number {
@@ -87,7 +93,7 @@ function ordinal(n: number): string {
  * and standings sections are each omitted gracefully if their data is missing.
  */
 export function formatRecapCast(args: FormatRecapCastArgs): string {
-  const { homeTricode, homeShortName, awayShortName, homeScore, awayScore, feverPlayers, standings } = args;
+  const { homeTricode, homeShortName, awayShortName, homeScore, awayScore, feverPlayers, standings, recapWatchUrl } = args;
 
   const feverIsHome = homeTricode === FEVER_TEAM_TRICODE;
   const feverShort = feverIsHome ? homeShortName : awayShortName;
@@ -111,6 +117,13 @@ export function formatRecapCast(args: FormatRecapCastArgs): string {
     sections.push(
       `📋 Record/streak/rank: ${standings.record} (${pct}) / ${standings.currentStreak} / ${ordinal(standings.conferenceRank)} in ${standings.conferenceLabel}`
     );
+  }
+
+  // Image-fallback only: give users a way to reach the video. The URL goes in
+  // the body (a link), never as the embed — the wnba.com/watch SPA has no
+  // og:video and renders as an empty card if embedded.
+  if (recapWatchUrl) {
+    sections.push(`▶️ Watch recap: ${recapWatchUrl}`);
   }
 
   const text = sections.join("\n\n");

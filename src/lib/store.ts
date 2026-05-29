@@ -36,6 +36,34 @@ export async function markGamePosted(
   });
 }
 
+// Provisional image-fallback marker. Set when we post the non-video thumbnail
+// cast after the initial retry window. Unlike GAME_POSTED this is NOT a final
+// seal — the game stays in the pending set so a later-arriving mp4 can reply to
+// this cast with the native video. We store the cast's {hash, fid} because the
+// Farcaster reply API identifies a parent by (author fid, hash).
+export interface FallbackCast {
+  hash: string;
+  fid?: number;
+}
+
+export async function markFallbackPosted(
+  gameId: string,
+  cast: FallbackCast
+): Promise<void> {
+  await getRedis().set(`${REDIS_KEYS.GAME_FALLBACK}${gameId}`, cast, {
+    ex: REDIS_TTL.GAME_FALLBACK,
+  });
+}
+
+export async function getFallbackPosted(
+  gameId: string
+): Promise<FallbackCast | null> {
+  const result = await getRedis().get<FallbackCast>(
+    `${REDIS_KEYS.GAME_FALLBACK}${gameId}`
+  );
+  return result ?? null;
+}
+
 // Game recap tracking (retry counter)
 export async function getGameTracking(gameId: string): Promise<number> {
   const result = await getRedis().get<number>(

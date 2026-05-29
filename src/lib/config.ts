@@ -17,11 +17,14 @@ export const YOUTUBE_OFFICIAL_CHANNELS = {
 
 // Redis key prefixes and TTLs
 export const REDIS_KEYS = {
-  GAME_POSTED: "fever:game:", // fever:game:{gameId} → cast hash
+  GAME_POSTED: "fever:game:", // fever:game:{gameId} → cast hash (native video, final)
   GAME_TRACKING: "fever:track:", // fever:track:{gameId} → retry count
   GAME_LOCK: "fever:lock:", // fever:lock:{gameId} → serialization lock
   PENDING_GAMES: "fever:pending", // Set of gameIds being retried across days
   NEWS_POSTED: "fever:news:", // fever:news:{espnArticleId} → cast hash
+  GAME_FALLBACK: "fever:fallback:", // fever:fallback:{gameId} → {hash,fid} of the
+                                    // provisional image-fallback cast, kept so a
+                                    // later-arriving mp4 can reply to it with video
 } as const;
 
 export const REDIS_TTL = {
@@ -34,12 +37,24 @@ export const REDIS_TTL = {
   NEWS_POSTED: 60 * 60 * 24 * 14, // 14 days — well beyond NEWS_LOOKBACK so
                                   // an article can't slip back into the
                                   // window after its dedup record expires
+  GAME_FALLBACK: 60 * 60 * 48, // 48h — must outlive RECAP_UPGRADE_WINDOW_MS so
+                               // the fallback cast's {hash,fid} is still readable
+                               // when a near-deadline mp4 arrives to upgrade it
 } as const;
 
-// Recap retry: 24 retries × 5 min interval = 2 hours max wait. The WNBA's
-// official YouTube channel typically publishes a recap within an hour or two
-// of a game ending. After this window we fall back to a YouTube-URL embed.
+// Recap retry: 24 retries at the 5-min cron interval before we post the
+// non-video IMAGE fallback (the recap thumbnail). The WNBA team site usually
+// publishes the downloadable mp4 within an hour or two of final; this window
+// covers the common case before showing users *something*.
 export const MAX_RECAP_RETRIES = 24;
+
+// After the image fallback posts we keep polling the team-site CDN for the mp4
+// for this long past tip-off; if it appears we reply to the fallback cast with
+// the native video (an upgrade). Late West-coast road games occasionally publish
+// the morning after, so this brackets a full next-day cycle. If it never appears
+// (some road games are never minted as a team-site mp4), the image fallback
+// simply stands and the game drops out of the pending rotation at the deadline.
+export const RECAP_UPGRADE_WINDOW_MS = 36 * 60 * 60 * 1000;
 
 // News: ESPN's team-filtered news endpoint. team=5 is the Indiana Fever's
 // internal ESPN team id. The endpoint returns ~50 items at limit=50 and is

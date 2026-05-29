@@ -19,8 +19,15 @@ import {
   listPendingGames,
   acquireGameLock,
   releaseGameLock,
+  getFallbackPosted,
+  markFallbackPosted,
 } from "../../../src/lib/store";
-import { FEVER_TEAM_TRICODE, MAX_RECAP_RETRIES } from "../../../src/lib/config";
+import {
+  FEVER_TEAM_TRICODE,
+  MAX_RECAP_RETRIES,
+  RECAP_UPGRADE_WINDOW_MS,
+  WNBA_GAME_PAGE_URL,
+} from "../../../src/lib/config";
 
 const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -155,9 +162,37 @@ async function processGameLocked(gameId: string): Promise<string> {
     return "boxscore unavailable";
   }
 
+  // Has a provisional image fallback already been posted for this game? If so,
+  // the game is NOT sealed (that's GAME_POSTED, set only on a native video) —
+  // we keep polling to upgrade it to video. fallback carries the {hash,fid}
+  // we reply under.
+  const fallback = await getFallbackPosted(gameId);
+
+  // True once we're past the window in which we'll keep chasing a late mp4.
+  // Prefer the boxscore tip time; fall back to the recap metadata's date.
+  const tipMs = box.gameTimeUTC ? new Date(box.gameTimeUTC).getTime() : NaN;
+  const pastUpgradeDeadline = (iso: string | null): boolean => {
+    const ms = Number.isFinite(tipMs)
+      ? tipMs
+      : iso
+        ? new Date(iso).getTime()
+        : NaN;
+    return Number.isFinite(ms) && Date.now() - ms > RECAP_UPGRADE_WINDOW_MS;
+  };
+
   // Look up the official WNBA recap metadata on the game page.
   const recapMeta = await getRecapMetadata(gameId);
   if (!recapMeta) {
+    // A fallback is already live; a null here is almost certainly transient
+    // (the game page persists). Keep waiting for the mp4 rather than abandon
+    // the upgrade — but still honor the deadline so we can't pend forever.
+    if (fallback) {
+      if (pastUpgradeDeadline(null)) {
+        await removePendingGame(gameId);
+        return "gave up: no mp4 within upgrade window; image fallback stands";
+      }
+      return "recap metadata transiently missing; awaiting mp4 upgrade";
+    }
     const count = await getGameTracking(gameId);
     if (count < MAX_RECAP_RETRIES) {
       await incrementGameTracking(gameId);
@@ -171,9 +206,9 @@ async function processGameLocked(gameId: string): Promise<string> {
   // metadata's gameDateISO if the boxscore didn't supply one.
   const gameDateISO = box.gameTimeUTC || recapMeta.gameDateISO;
 
-  // Source the clean 720p mp4 directly from the WNBA team-site CDN. The
-  // recap is uploaded ~1-2 hours after final, so the first few retries may
-  // 404 while we wait for the digital staff to publish it.
+  // Source the clean 720p mp4 directly from the WNBA team-site CDN. The recap
+  // is uploaded ~1-2 hours after final (and for some road games never at all),
+  // so this 404s while we wait for the digital staff to publish it.
   let playbackUrl: string | null = null;
   let videoFailureReason: string | null = null;
 
@@ -187,18 +222,6 @@ async function processGameLocked(gameId: string): Promise<string> {
     }
   }
 
-  if (videoFailureReason) {
-    const count = await getGameTracking(gameId);
-    if (count < MAX_RECAP_RETRIES) {
-      await incrementGameTracking(gameId);
-      return `${videoFailureReason} (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
-    }
-    console.warn(
-      `[check-games] ${videoFailureReason} after ${MAX_RECAP_RETRIES} retries — falling back to permalink embed`
-    );
-    // Fall through to the post step with playbackUrl still null.
-  }
-
   const isHome = box.home.teamTricode === FEVER_TEAM_TRICODE;
   const feverPlayers = (isHome ? box.home.players : box.away.players) || [];
 
@@ -209,7 +232,7 @@ async function processGameLocked(gameId: string): Promise<string> {
     return null;
   });
 
-  const text = formatRecapCast({
+  const baseRecap = {
     homeTricode: box.home.teamTricode,
     awayTricode: box.away.teamTricode,
     homeShortName: box.home.teamName,
@@ -218,23 +241,83 @@ async function processGameLocked(gameId: string): Promise<string> {
     awayScore: box.away.score,
     feverPlayers,
     standings,
-  });
+  };
 
-  const usingVideo = playbackUrl !== null;
-  const embedUrl = playbackUrl ?? recapMeta.permalink;
+  // ---- CASE A: we have a native video ----
+  if (playbackUrl) {
+    const text = formatRecapCast(baseRecap);
+
+    // If an image fallback already posted, thread the video under it as a reply
+    // (an in-place "upgrade") instead of a duplicate top-level cast. The reply
+    // parent is (author fid, hash); we capture the fid when posting the
+    // fallback, with FARCASTER_FID as a backstop.
+    const parentFid =
+      fallback?.fid ??
+      (process.env.FARCASTER_FID ? Number(process.env.FARCASTER_FID) : undefined);
+    const parent =
+      fallback && parentFid ? { fid: parentFid, hash: fallback.hash } : undefined;
+
+    const result = await postToChannel(text, {
+      embeds: [{ url: playbackUrl }],
+      hasVideo: true,
+      idem: `fever-game-${gameId}`,
+      parent,
+    });
+
+    if (result.hash) {
+      await markGamePosted(gameId, result.hash);
+      await removePendingGame(gameId);
+      if (!fallback) return `posted (video): ${result.hash}`;
+      return parent
+        ? `posted (video upgrade reply): ${result.hash}`
+        : `posted (video upgrade, non-reply — no parent fid): ${result.hash}`;
+    }
+    return `post failed: ${result.error}`;
+  }
+
+  // ---- CASE B: no native video ----
+
+  // B1: an image fallback is already live — never re-post it. Keep polling for
+  // the mp4 to upgrade, or give up once past the deadline (the image stands).
+  if (fallback) {
+    if (pastUpgradeDeadline(gameDateISO)) {
+      await removePendingGame(gameId);
+      return "gave up: no mp4 within upgrade window; image fallback stands";
+    }
+    return `${videoFailureReason}; image fallback already posted, awaiting mp4 upgrade`;
+  }
+
+  // B2: no fallback yet — keep retrying for the mp4 through the initial window.
+  const count = await getGameTracking(gameId);
+  if (count < MAX_RECAP_RETRIES) {
+    await incrementGameTracking(gameId);
+    return `${videoFailureReason} (retry ${count + 1}/${MAX_RECAP_RETRIES})`;
+  }
+
+  // Initial window exhausted — post the image fallback: the recap's own
+  // thumbnail as the embed (a direct image renders as a clean inline card; the
+  // wnba.com/watch permalink does NOT — its head has no og:video and renders an
+  // empty card) plus a "Watch recap" link in the body. Crucially we do NOT seal
+  // the game (no markGamePosted / removePendingGame) so a later mp4 can upgrade.
+  console.warn(
+    `[check-games] ${videoFailureReason} after ${MAX_RECAP_RETRIES} retries — posting image fallback`
+  );
+  const text = formatRecapCast({
+    ...baseRecap,
+    recapWatchUrl: recapMeta.permalink || undefined,
+  });
+  const embedUrl = recapMeta.featuredImage || WNBA_GAME_PAGE_URL(gameId);
 
   const result = await postToChannel(text, {
     embeds: [{ url: embedUrl }],
-    hasVideo: usingVideo,
     idem: `fever-game-${gameId}`,
   });
 
   if (result.hash) {
-    await markGamePosted(gameId, result.hash);
-    await removePendingGame(gameId);
-    return usingVideo
-      ? `posted (video): ${result.hash}`
-      : `posted (permalink-fallback): ${result.hash}`;
+    await markFallbackPosted(gameId, { hash: result.hash, fid: result.fid });
+    // Intentionally NOT markGamePosted / removePendingGame — keep the game
+    // eligible so a later-arriving mp4 upgrades it to a native-video reply.
+    return `posted (image fallback): ${result.hash} — awaiting mp4 upgrade`;
   }
   return `post failed: ${result.error}`;
 }
