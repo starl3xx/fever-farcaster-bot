@@ -75,10 +75,15 @@ export async function getGameTracking(gameId: string): Promise<number> {
 export async function incrementGameTracking(gameId: string): Promise<number> {
   const key = `${REDIS_KEYS.GAME_TRACKING}${gameId}`;
   const count = await getRedis().incr(key);
-  // Set TTL on first increment
-  if (count === 1) {
-    await getRedis().expire(key, REDIS_TTL.GAME_TRACKING);
-  }
+  // Refresh the TTL on EVERY increment (sliding window), not just the first.
+  // The per-game lock throttles real processing — and thus increments — to
+  // ~1 per 15 min (the 700s lock TTL spans 2-3 of the 5-min cron ticks), so
+  // climbing to MAX_RECAP_RETRIES takes hours. A one-shot TTL anchored at
+  // count===1 would expire mid-climb and reset the counter to 0, so the image
+  // fallback could never fire. Sliding the TTL keeps the counter alive until
+  // the game goes quiet (increments stop the moment a fallback/post exists),
+  // after which it's GC'd within REDIS_TTL.GAME_TRACKING of the last increment.
+  await getRedis().expire(key, REDIS_TTL.GAME_TRACKING);
   return count;
 }
 

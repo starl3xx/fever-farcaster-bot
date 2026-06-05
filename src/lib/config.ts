@@ -29,7 +29,11 @@ export const REDIS_KEYS = {
 
 export const REDIS_TTL = {
   GAME_POSTED: 60 * 60 * 24 * 30, // 30 days
-  GAME_TRACKING: 60 * 60 * 6, // 6 hours — must outlive MAX_RECAP_RETRIES
+  // Tracking counter TTL. incrementGameTracking() slides this on every
+  // increment, so it only needs to outlive the GAP between real-processing
+  // runs (~15 min under the per-game lock), not the whole retry climb. 6h is
+  // ample headroom and also GCs the counter once increments stop.
+  GAME_TRACKING: 60 * 60 * 6,
   // Lock TTL must exceed function maxDuration (600s) so a crashed invocation
   // can't leave the lock held indefinitely, but is short enough that real
   // failures recover within a couple cron intervals.
@@ -42,11 +46,18 @@ export const REDIS_TTL = {
                                // when a near-deadline mp4 arrives to upgrade it
 } as const;
 
-// Recap retry: 24 retries at the 5-min cron interval before we post the
-// non-video IMAGE fallback (the recap thumbnail). The WNBA team site usually
-// publishes the downloadable mp4 within an hour or two of final; this window
-// covers the common case before showing users *something*.
-export const MAX_RECAP_RETRIES = 24;
+// Recap retry: how many real-processing runs to wait for the team-site mp4
+// before posting the non-video IMAGE fallback (the recap thumbnail). The
+// effective cadence is NOT the 5-min cron — the per-game lock (GAME_LOCK = 700s)
+// is held across non-success runs, so real processing (and thus each increment)
+// happens only ~once per 15 min. 12 ≈ 3h, giving the WNBA team site (usually
+// publishes within an hour or two of final) time to post before we show users
+// *something*; a late mp4 still upgrades the image to a native-video reply
+// within RECAP_UPGRADE_WINDOW_MS. Kept modest because this same counter also
+// gates the "no recap metadata, give up" branch (which posts nothing), so we
+// don't want to abandon a flaky game-page fetch too eagerly. If you change
+// GAME_LOCK, revisit this — the lock cadence is what maps retries to wall time.
+export const MAX_RECAP_RETRIES = 12;
 
 // After the image fallback posts we keep polling the team-site CDN for the mp4
 // for this long past tip-off; if it appears we reply to the fallback cast with
