@@ -1,7 +1,8 @@
+import type { BoxscorePlayer } from "./formatter";
 import {
   FEVER_TEAM_TRICODE,
-  WNBA_SCOREBOARD_URL,
-  WNBA_GAME_PAGE_URL,
+  ESPN_SCOREBOARD_URL,
+  ESPN_SUMMARY_URL,
   WNBA_STANDINGS_URL,
 } from "./config";
 
@@ -9,7 +10,7 @@ const BROWSER_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 export interface FeverGame {
-  gameId: string;
+  gameId: string; // ESPN event id (e.g. "401856995")
   homeTricode: string;
   awayTricode: string;
   gameStatus: number;
@@ -17,155 +18,236 @@ export interface FeverGame {
   isFinal: boolean;
 }
 
-export interface RecapMetadata {
-  id: string;
-  title: string;
-  permalink: string;
-  videoDurationSeconds: number;
-  featuredImage: string;
-  franchiseName: string;
-  gameDateISO: string;
+export interface GameSummaryTeam {
+  teamTricode: string; // e.g. "IND"
+  teamName: string; // short name, e.g. "Fever"
+  teamCity: string; // e.g. "Indiana"
+  score: number;
+  players: BoxscorePlayer[];
+}
+
+export interface GameSummary {
+  home: GameSummaryTeam;
+  away: GameSummaryTeam;
+  gameTimeUTC: string | null;
+  /** Recap thumbnail (a direct image URL) for the non-video image fallback. */
+  recapThumbnail: string | null;
+  /** ESPN gamecast URL, dropped in the fallback body as a "watch" link. */
+  recapWatchUrl: string | null;
 }
 
 /**
- * Parse a duration string like "02:02" or "1:23:45" into total seconds.
+ * Fetch JSON defensively. The dead WNBA endpoints returned a 200 with an HTML
+ * body, so a naive res.json() threw a SyntaxError that 500'd the whole cron on
+ * every tick. Here a non-OK status, a non-JSON body, or a parse error all
+ * resolve to null and log — the caller degrades gracefully instead of crashing.
  */
-function parseDurationToSeconds(raw: unknown): number {
-  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
-  if (typeof raw !== "string") return 0;
-  const parts = raw.split(":").map((p) => parseInt(p, 10));
-  if (parts.some(Number.isNaN)) return 0;
-  let seconds = 0;
-  for (const p of parts) {
-    seconds = seconds * 60 + p;
+async function fetchJsonSafe<T>(url: string, tag: string): Promise<T | null> {
+  try {
+    const res = await fetch(url, {
+      headers: { "User-Agent": BROWSER_UA, Accept: "application/json" },
+    });
+    if (!res.ok) {
+      console.error(`[${tag}] fetch failed: ${res.status}`);
+      return null;
+    }
+    const ct = res.headers.get("content-type") || "";
+    const body = await res.text();
+    if (!ct.includes("json") && !body.trimStart().startsWith("{")) {
+      console.error(
+        `[${tag}] non-JSON response (content-type: ${ct || "none"}); first chars: ${body.slice(0, 40)}`
+      );
+      return null;
+    }
+    return JSON.parse(body) as T;
+  } catch (err) {
+    console.error(`[${tag}] fetch/parse error:`, err);
+    return null;
   }
-  return seconds;
 }
 
 /**
- * Fetch the WNBA scoreboard for today and return all games involving the
- * Indiana Fever (IND), in either home or away slot.
+ * ESPN's scoreboard buckets by calendar day, so a game that tips late and
+ * finals after midnight can sit in "yesterday". We query yesterday + today (ET)
+ * and dedup by event id so a just-finished game is never missed at the rollover.
+ */
+function espnDateWindow(): string[] {
+  const fmt = (d: Date) =>
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    })
+      .format(d)
+      .replace(/-/g, "");
+  const now = new Date();
+  const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  return [fmt(now), fmt(yesterday)];
+}
+
+/**
+ * Return all recent Fever games (yesterday + today, ET) from ESPN, in either
+ * home or away slot. Returns [] on any upstream failure so the cron can still
+ * fall through to its pending-game retries instead of erroring out.
  */
 export async function getTodaysFeverGames(): Promise<FeverGame[]> {
-  const res = await fetch(WNBA_SCOREBOARD_URL, {
-    headers: {
-      "User-Agent": BROWSER_UA,
-      Accept: "application/json",
-    },
-  });
+  const games = new Map<string, FeverGame>();
 
-  if (!res.ok) {
-    throw new Error(`WNBA scoreboard fetch failed: ${res.status}`);
-  }
+  for (const date of espnDateWindow()) {
+    const data = await fetchJsonSafe<any>(
+      `${ESPN_SCOREBOARD_URL}?dates=${date}`,
+      "scoreboard"
+    );
+    const events: any[] = data?.events || [];
+    for (const e of events) {
+      const comp = e?.competitions?.[0];
+      const competitors: any[] = comp?.competitors || [];
+      const home = competitors.find((c) => c?.homeAway === "home");
+      const away = competitors.find((c) => c?.homeAway === "away");
+      const homeTricode = String(home?.team?.abbreviation || "");
+      const awayTricode = String(away?.team?.abbreviation || "");
 
-  const data = await res.json();
-  const games: any[] = data?.scoreboard?.games || [];
+      if (
+        homeTricode !== FEVER_TEAM_TRICODE &&
+        awayTricode !== FEVER_TEAM_TRICODE
+      ) {
+        continue;
+      }
 
-  const feverGames: FeverGame[] = [];
-  for (const game of games) {
-    const homeTricode: string = game?.homeTeam?.teamTricode || "";
-    const awayTricode: string = game?.awayTeam?.teamTricode || "";
+      const gameId = String(e?.id || "");
+      if (!gameId) continue;
 
-    if (homeTricode !== FEVER_TEAM_TRICODE && awayTricode !== FEVER_TEAM_TRICODE) {
-      continue;
+      const type = comp?.status?.type || e?.status?.type || {};
+      const isFinal = type?.completed === true;
+
+      games.set(gameId, {
+        gameId,
+        homeTricode,
+        awayTricode,
+        // 3 == Final, matching the old WNBA convention the rest of the code reads.
+        gameStatus: isFinal ? 3 : Number(type?.id ?? 0),
+        gameStatusText: String(type?.description || type?.shortDetail || ""),
+        isFinal,
+      });
     }
-
-    const gameStatus: number = Number(game?.gameStatus ?? 0);
-    const gameStatusText: string = game?.gameStatusText || "";
-
-    // gameStatus === 3 means Final in NBA/WNBA APIs. Confirm via text just in case.
-    const isFinal =
-      gameStatus === 3 ||
-      gameStatusText.toLowerCase().includes("final");
-
-    feverGames.push({
-      gameId: String(game?.gameId || ""),
-      homeTricode,
-      awayTricode,
-      gameStatus,
-      gameStatusText,
-      isFinal,
-    });
   }
 
-  return feverGames;
+  return Array.from(games.values());
 }
 
 /**
- * Fetch the WNBA game page and extract the official recap video metadata
- * from the embedded __NEXT_DATA__ JSON.
- *
- * Preference order:
- *   1. videoFranchisesName === "2-minute-game-recap" with entitlements === "free"
- *   2. videoFranchisesName === "quick-game" with entitlements === "free"
- *   3. null
+ * Map one ESPN boxscore athlete (a positional stats array keyed by `labels`)
+ * onto the BoxscorePlayer shape the formatter consumes. ESPN exposes no
+ * first/last name split, so displayName is split on the first space. A player
+ * counts as ACTIVE only if they actually logged stats — ESPN's `active`/`reason`
+ * fields are unreliable (e.g. a 32-minute starter can show active=false).
  */
-export async function getRecapMetadata(
-  gameId: string
-): Promise<RecapMetadata | null> {
-  const res = await fetch(WNBA_GAME_PAGE_URL(gameId), {
-    headers: {
-      "User-Agent": BROWSER_UA,
-      Accept: "text/html,application/xhtml+xml",
-    },
-  });
+function mapEspnAthlete(
+  a: any,
+  labelIdx: Record<string, number>
+): BoxscorePlayer {
+  const stats: string[] = Array.isArray(a?.stats) ? a.stats : [];
+  const played = a?.didNotPlay !== true && stats.length > 0;
 
-  if (!res.ok) {
-    console.error(`[wnba] game page fetch failed: ${res.status}`);
-    return null;
-  }
+  const get = (label: string): string => {
+    const i = labelIdx[label];
+    return i === undefined ? "" : String(stats[i] ?? "");
+  };
+  const splitMadeAttempted = (v: string): { made: number; att: number } => {
+    const [made, att] = v.split("-");
+    return { made: parseInt(made, 10) || 0, att: parseInt(att, 10) || 0 };
+  };
 
-  const html = await res.text();
-  const match = html.match(
-    /<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/
-  );
-  if (!match) {
-    console.error("[wnba] No __NEXT_DATA__ script tag in game page");
-    return null;
-  }
+  const fg = splitMadeAttempted(get("FG"));
+  const ft = splitMadeAttempted(get("FT"));
 
-  let payload: any;
-  try {
-    payload = JSON.parse(match[1]);
-  } catch (err) {
-    console.error("[wnba] Failed to parse __NEXT_DATA__ JSON:", err);
-    return null;
-  }
-
-  const pageProps = payload?.props?.pageProps || {};
-  const highlightVideos: any[] = pageProps?.highlightVideos || [];
-
-  if (!highlightVideos.length) {
-    return null;
-  }
-
-  // Try preferred franchise first, then fallback.
-  const findByFranchise = (franchise: string) =>
-    highlightVideos.find(
-      (v) =>
-        v?.videoFranchisesName === franchise && v?.entitlements === "free"
-    );
-
-  const pick = findByFranchise("2-minute-game-recap") || findByFranchise("quick-game");
-  if (!pick) return null;
-
-  const gameDateISO: string =
-    pick?.gameDateISO ||
-    pageProps?.game?.gameDateUTC ||
-    pageProps?.game?.gameDateEst ||
-    pageProps?.gameDate ||
-    new Date().toISOString();
+  const name = String(a?.athlete?.displayName || "").trim();
+  const sp = name.indexOf(" ");
+  const firstName = sp === -1 ? name : name.slice(0, sp);
+  const familyName = sp === -1 ? "" : name.slice(sp + 1);
 
   return {
-    id: String(pick?.id || ""),
-    title: String(pick?.title || ""),
-    permalink: String(pick?.permalink || ""),
-    videoDurationSeconds: parseDurationToSeconds(
-      pick?.videoDurationSeconds ?? pick?.videoDuration
-    ),
-    featuredImage: String(pick?.featuredImage || ""),
-    franchiseName: String(pick?.videoFranchisesName || ""),
-    gameDateISO,
+    status: played ? "ACTIVE" : "DNP",
+    firstName,
+    familyName,
+    statistics: {
+      points: get("PTS"),
+      reboundsTotal: get("REB"),
+      assists: get("AST"),
+      steals: get("STL"),
+      blocks: get("BLK"),
+      fieldGoalsMade: fg.made,
+      fieldGoalsAttempted: fg.att,
+      freeThrowsMade: ft.made,
+      freeThrowsAttempted: ft.att,
+      turnovers: get("TO"),
+    },
+  };
+}
+
+/**
+ * Fetch the ESPN game summary for an event id and project it into the scores,
+ * team names, Fever boxscore, tip time, and a recap card (thumbnail + gamecast
+ * link) the recap pipeline needs. One request supplies everything the old
+ * boxscore + WNBA-game-page pair used to. Returns null on any upstream failure.
+ */
+export async function fetchGameSummary(
+  eventId: string
+): Promise<GameSummary | null> {
+  const data = await fetchJsonSafe<any>(ESPN_SUMMARY_URL(eventId), "summary");
+  if (!data) return null;
+
+  const comp = data?.header?.competitions?.[0];
+  const competitors: any[] = comp?.competitors || [];
+  const homeC = competitors.find((c) => c?.homeAway === "home");
+  const awayC = competitors.find((c) => c?.homeAway === "away");
+  if (!homeC || !awayC) return null;
+
+  const playerBlocks: any[] = data?.boxscore?.players || [];
+  const playersFor = (abbr: string): BoxscorePlayer[] => {
+    const block = playerBlocks.find((b) => b?.team?.abbreviation === abbr);
+    const grp = block?.statistics?.[0];
+    if (!grp) return [];
+    const labels: string[] = grp.labels || grp.names || [];
+    const labelIdx: Record<string, number> = {};
+    labels.forEach((l, i) => {
+      labelIdx[l] = i;
+    });
+    const athletes: any[] = grp.athletes || [];
+    return athletes.map((a) => mapEspnAthlete(a, labelIdx));
+  };
+
+  const team = (c: any): GameSummaryTeam => {
+    const t = c?.team || {};
+    const tricode = String(t.abbreviation || "");
+    return {
+      teamTricode: tricode,
+      teamName: String(t.name || ""),
+      teamCity: String(t.location || ""),
+      score: Number(c?.score ?? 0),
+      players: playersFor(tricode),
+    };
+  };
+
+  // Fallback card: prefer the recap article image, then the first highlight
+  // thumbnail. Both are direct images that render as clean inline cards (unlike
+  // the wnba.com/watch SPA, whose head has no og:video → empty card).
+  const recapThumbnail =
+    data?.article?.images?.[0]?.url || data?.videos?.[0]?.thumbnail || null;
+  const recapWatchUrl =
+    (data?.header?.links || []).find((l: any) =>
+      (l?.rel || []).includes("summary")
+    )?.href ||
+    data?.article?.links?.web?.href ||
+    null;
+
+  return {
+    home: team(homeC),
+    away: team(awayC),
+    gameTimeUTC: comp?.date ? String(comp.date) : null,
+    recapThumbnail: recapThumbnail ? String(recapThumbnail) : null,
+    recapWatchUrl: recapWatchUrl ? String(recapWatchUrl) : null,
   };
 }
 
