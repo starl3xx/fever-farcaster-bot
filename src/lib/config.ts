@@ -2,9 +2,19 @@ export const FEVER_TEAM_TRICODE = "IND";
 export const FEVER_TEAM_NAME = "Indiana Fever";
 export const CHANNEL_ID = process.env.FARCASTER_CHANNEL_ID || "fever";
 export const CAST_CHAR_LIMIT = 1024;
-export const WNBA_LEAGUE_ID = 10;
-export const WNBA_SCOREBOARD_URL = `https://cdn.wnba.com/static/json/liveData/scoreboard/todaysScoreboard_${WNBA_LEAGUE_ID}.json`;
-export const WNBA_GAME_PAGE_URL = (gameId: string) => `https://www.wnba.com/game/${gameId}`;
+
+// Game data is sourced from ESPN. The WNBA's own JSON platform
+// (cdn.wnba.com/static/json/..., stats.wnba.com) was retired in 2026 — every
+// path now returns a 200 with an HTML placeholder, which silently broke the
+// recap cron (res.json() threw a SyntaxError on the leading "<"). ESPN's public
+// site API is JSON, stable, and already powers the news cron.
+export const ESPN_SCOREBOARD_URL =
+  "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard";
+export const ESPN_SUMMARY_URL = (eventId: string) =>
+  `https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary?event=${eventId}`;
+
+// The standings page is a www.wnba.com Next.js route (not the dead JSON CDN),
+// so it still renders and we keep scraping its embedded __NEXT_DATA__.
 export const WNBA_STANDINGS_URL = "https://www.wnba.com/standings";
 
 // YouTube channels to search for official recaps (preferred order).
@@ -83,3 +93,17 @@ export const NEWS_LOOKBACK_MS = 4 * 60 * 60 * 1000;
 // with this bot's own recap casts; HeadlineNews and Story are the editorial
 // feature buckets where we'd add real value.
 export const NEWS_POSTABLE_TYPES = ["HeadlineNews", "Story"] as const;
+
+// Pull-quote extraction. We feed each article's full body to Claude Haiku and
+// ask for the single best direct quote (or null when there isn't one). Haiku is
+// cheap enough to run per-article on the handful of new items each cron sees,
+// and the feature degrades to a headline-only cast whenever the key is unset or
+// a call fails — see src/lib/pull-quote.ts.
+export const ANTHROPIC_MODEL = "claude-haiku-4-5";
+// Cap how much article text we send. Quotes nearly always sit in the first few
+// paragraphs, and this keeps token usage (and latency) predictable on the long
+// feature stories ESPN occasionally runs (~14k chars).
+export const PULL_QUOTE_MAX_BODY_CHARS = 8000;
+// Keep the rendered quote block comfortably inside a cast alongside the headline
+// and byline trail. Claude is asked to stay under this; we also trim defensively.
+export const PULL_QUOTE_MAX_CHARS = 320;
